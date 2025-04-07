@@ -414,22 +414,35 @@ where
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let rects = Layout::vertical([
+    // Split the screen horizontally into left and right halves.
+    let horizontal_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(f.size());
+
+    // Left side: existing vertical layout.
+    let left_rects = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
         Constraint::Length(3),
     ])
-    .split(f.size());
+    .split(horizontal_chunks[0]);
 
-    render_searchbar(f, app, rects[0]);
+    render_searchbar(f, app, left_rects[0]);
+    render_table(f, app, left_rects[1]);
+    render_footer(f, app, left_rects[2]);
 
-    render_table(f, app, rects[1]);
+    // Right side: render a blank frame with a border and title.
+    let blank_block = Block::default()
+        .title("Blank")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    f.render_widget(blank_block, horizontal_chunks[1]);
 
-    render_footer(f, app, rects[2]);
-
+    // Position the cursor on the left side as before.
     f.set_cursor(
-        rects[0].x + u16::try_from(app.search.cursor()).unwrap_or_default() + 4,
-        rects[0].y + 1,
+        left_rects[0].x + u16::try_from(app.search.cursor()).unwrap_or_default() + 4,
+        left_rects[0].y + 1,
     );
 }
 
