@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::{
     cell::RefCell,
     cmp::{max, min},
-    env, fs, io,
+    env, io,
     rc::Rc,
 };
 use style::palette::tailwind;
@@ -109,9 +109,7 @@ impl App {
                 move |host: &&ssh::Host, search_value: &str| -> bool {
                     search_value.is_empty()
                         || matcher.fuzzy_match(&host.name, search_value).is_some()
-                        || matcher
-                            .fuzzy_match(&host.destination, search_value)
-                            .is_some()
+                        || matcher.fuzzy_match(&host.hostname, search_value).is_some()
                         || matcher.fuzzy_match(&host.aliases, search_value).is_some()
                 },
             ),
@@ -332,7 +330,7 @@ impl App {
         let destination_len = self
             .hosts
             .non_filtered_iter()
-            .map(|d| d.destination.as_str())
+            .map(|d| d.hostname.as_str())
             .map(UnicodeWidthStr::width)
             .max()
             .unwrap_or(0);
@@ -418,8 +416,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Parse ~/.ssh/config file
     let home = env::var("HOME").expect("HOME not set");
     let config_path = format!("{}/.ssh/config", home);
-    let config_file = fs::read_to_string(config_path).unwrap_or_default();
-
     let parsed_hosts = ssh::parse_config(&config_path).unwrap_or_default();
     let host_map: HashMap<String, ssh::Host> = parsed_hosts
         .into_iter()
@@ -449,12 +445,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         if selected < app.hosts.len() {
             let selected_host_name = &app.hosts[selected].name;
             if let Some(host) = host_map.get(selected_host_name) {
-                let mut host_info = String::new();
-                host_info.push_str(&format!("Name: {}\n", host.name));
-                for (key, value) in &host {
-                    host_info.push_str(&format!("{}: {}\n", key, value));
-                }
-                host_info
+                // Use the helper method to iterate over (key, value) pairs.
+                host.iter_fields()
+                    .into_iter()
+                    .map(|(key, value)| format!("{}: {}\n", key, value))
+                    .collect::<String>()
             } else {
                 "Host not found in map".to_string()
             }
@@ -515,7 +510,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             host.name.clone(),
             host.aliases.clone(),
             host.user.clone().unwrap_or_default(),
-            host.destination.clone(),
+            host.hostname.clone(),
             host.port.clone().unwrap_or_default(),
         ];
         if app.config.show_proxy_command {
