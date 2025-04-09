@@ -11,10 +11,11 @@ use crossterm::{
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 #[allow(clippy::wildcard_imports)]
 use ratatui::{prelude::*, widgets::*};
+use std::collections::HashMap;
 use std::{
     cell::RefCell,
     cmp::{max, min},
-    io,
+    env, fs, io,
     rc::Rc,
 };
 use style::palette::tailwind;
@@ -414,6 +415,17 @@ where
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    // Parse ~/.ssh/config file
+    let home = env::var("HOME").expect("HOME not set");
+    let config_path = format!("{}/.ssh/config", home);
+    let config_file = fs::read_to_string(config_path).unwrap_or_default();
+
+    let parsed_hosts = ssh::parse_config(&config_path).unwrap_or_default();
+    let host_map: HashMap<String, ssh::Host> = parsed_hosts
+        .into_iter()
+        .map(|host| (host.name.clone(), host))
+        .collect();
+
     // Split the screen horizontally into left and right halves.
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -432,12 +444,36 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_table(f, app, left_rects[1]);
     render_footer(f, app, left_rects[2]);
 
-    // Right side: render a blank frame with a border and title.
-    let blank_block = Block::default()
-        .title("Blank")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
-    f.render_widget(blank_block, horizontal_chunks[1]);
+    // Right side: display selected host configuration.
+    let config_text = if let Some(selected) = app.table_state.selected() {
+        if selected < app.hosts.len() {
+            let selected_host_name = &app.hosts[selected].name;
+            if let Some(host) = host_map.get(selected_host_name) {
+                let mut host_info = String::new();
+                host_info.push_str(&format!("Name: {}\n", host.name));
+                for (key, value) in &host {
+                    host_info.push_str(&format!("{}: {}\n", key, value));
+                }
+                host_info
+            } else {
+                "Host not found in map".to_string()
+            }
+        } else {
+            "No host selected".to_string()
+        }
+    } else {
+        "No host selected".to_string()
+    };
+
+    let config_paragraph = Paragraph::new(config_text)
+        .block(
+            Block::default()
+                .title("Configuration")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(config_paragraph, horizontal_chunks[1]);
 
     // Position the cursor on the left side as before.
     f.set_cursor(
