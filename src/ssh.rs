@@ -145,15 +145,15 @@ impl Host {
         Ok(())
     }
 
+    /// Return all fields as (key, value) pairs where the value is a nonblank string.
     pub fn iter_fields(&self) -> Vec<(String, String)> {
         let mut fields = Vec::new();
 
         // Convert the struct to a JSON value.
-        // Note: This assumes all fields serialize as strings or null.
+        // NOTE: This assumes all fields serialize as either strings or null.
         if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(self) {
             for (key, value) in map {
-                // Convert each value to a string if possible,
-                // and ignore empty strings or null values.
+                // Only add non-null, nonblank string values.
                 if let serde_json::Value::String(s) = value {
                     if !s.trim().is_empty() {
                         fields.push((key, s));
@@ -202,7 +202,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
                 .first()
                 .unwrap_or(&String::new())
                 .clone(),
-            aliases: host.get_patterns().iter().skip(1).join(", "),
+            aliases: host.get_patterns().iter().skip(1).join(" "),
             user: host.get(&ssh_config::EntryType::User),
             hostname: host
                 .get(&ssh_config::EntryType::Hostname)
@@ -398,7 +398,31 @@ pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
 
 /// Convert a Host into lines of SSH config (Vec<String>).
 fn format_host_block(host: &Host) -> Vec<String> {
-    let mut lines = vec![format!("Host {}", host.name)];
+    // Process the aliases field: split by comma, trim any whitespace,
+    // and collect non-empty entries.
+    let aliases = if !host.aliases.trim().is_empty() {
+        host.aliases
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<&str>>()
+            .join(" ")
+    } else {
+        String::new()
+    };
+
+    // Construct the Host header line.
+    // If there are aliases, append them after the primary host name.
+    let host_line = if aliases.is_empty() {
+        format!("Host {}", host.name)
+    } else {
+        format!("Host {} {}", host.name, aliases)
+    };
+
+    let mut lines = vec![host_line];
+
+    // Now output the rest of the fields.
+    // Exclude "name" and "aliases" from individual entries.
     for (key, value) in host.iter_fields() {
         if key != "name" && key != "aliases" {
             let ssh_key = format_ssh_key(&key);

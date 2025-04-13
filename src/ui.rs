@@ -154,73 +154,94 @@ impl App {
     fn load_editing_fields(&mut self) {
         if let Some(selected) = self.table_state.selected() {
             if selected < self.hosts.len() {
-                // Only reload if selection changed.
+                // Only reload if selection has changed.
                 if let Some(last) = self.last_selected_index {
+                    // Even if the selection has not changed, refresh the fields for consistency.
                     if last == selected {
+                        self.refresh_editing_fields();
                         return;
                     }
                 }
                 self.last_selected_index = Some(selected);
                 let host = &self.hosts[selected];
                 self.edited_host = Some(host.clone());
-                self.editing_fields.clear();
-                self.in_field_edit = false; // start in selection mode
-
-                if let Some(ref host) = self.edited_host {
-                    // Use the host's iter_fields() method to get all (field, value) pairs.
-                    let mut fields = host.iter_fields();
-                    // Optionally sort the fields alphabetically by name:
-                    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-                    // For each field, initialize an Input widget with the current value.
-                    for (key, value) in fields {
-                        let input: Input = value.into();
-                        self.editing_fields.push((key, input));
-                    }
-                }
+                // Reset editing state.
+                self.in_field_edit = false;
                 self.edit_field_index = 0;
+
+                // Instead of manually iterating and pushing the fields, simply call
+                // refresh_editing_fields(), which takes care of building the editing_fields
+                // with the PascalCase conversion.
+                self.refresh_editing_fields();
             }
         }
     }
 
     fn commit_field(&mut self) {
-        if let Some(ref mut edited_host) = self.edited_host {
-            // Convert the current host into a JSON value (must derive Serialize)
+        // Build a new updated host from the current edited_host.
+        let new_host = if let Some(edited_host) = self.edited_host.as_mut() {
+            // Serialize the host into a JSON value.
             let mut host_value =
-                serde_json::to_value(&mut *edited_host).expect("Failed to serialize host");
-            // We need to work with the Object (map) representation
+                serde_json::to_value(edited_host).expect("Failed to serialize host");
             if let serde_json::Value::Object(ref mut map) = host_value {
+                // For each editable field, update the value.
                 for (field, input) in &self.editing_fields {
-                    // If the new value is empty then store null, otherwise update with the new string.
-                    // You can adjust this behavior if you prefer an empty string instead of null.
                     let new_val = if input.value().is_empty() {
-                        serde_json::Value::Null
+                        // For the "aliases" field, store an empty string instead of null.
+                        if field == "aliases" {
+                            serde_json::Value::String(String::new())
+                        } else {
+                            serde_json::Value::Null
+                        }
                     } else {
                         serde_json::Value::String(input.value().to_string())
                     };
-                    // Insert or update the field in the map.
                     map.insert(field.clone(), new_val);
                 }
             }
-            // Convert the updated JSON value back into a Host.
-            let updated_host: ssh::Host =
-                serde_json::from_value(host_value).expect("Failed to deserialize host");
-            *edited_host = updated_host;
+            // Deserialize the updated JSON back into a host.
+            serde_json::from_value(host_value).expect("Failed to deserialize host")
+        } else {
+            return;
+        };
 
-            // Now save the updated host to disk.
-            let home = env::var("HOME").expect("HOME not set");
-            let config_path = format!("{}/.ssh/config", home);
-            match ssh::save_config(edited_host, &config_path) {
-                Ok(()) => {
-                    if let Some(selected) = self.table_state.selected() {
-                        if let Some(host) = self.hosts.get_mut(selected) {
-                            *host = edited_host.clone();
-                            self.hosts.search(self.search.value());
-                        }
-                    }
+        // Reassign the updated host to self.edited_host.
+        self.edited_host = Some(new_host);
+
+        // Now, refresh the editing fields since the host has been updated.
+        self.refresh_editing_fields();
+
+        // Update the host list and save changes to disk.
+        if let Some(selected) = self.table_state.selected() {
+            if let Some(host) = self.hosts.get_mut(selected) {
+                if let Some(ref edited_host) = self.edited_host {
+                    *host = edited_host.clone();
+                    self.hosts.search(self.search.value());
                 }
-                Err(e) => {
-                    println!("Error saving host: {:?}", e);
-                }
+            }
+        }
+
+        let home = std::env::var("HOME").expect("HOME not set");
+        let config_path = format!("{}/.ssh/config", home);
+        match ssh::save_config(self.edited_host.as_ref().unwrap(), &config_path) {
+            Ok(()) => { /* Successfully saved */ }
+            Err(e) => println!("Error saving host: {:?}", e),
+        }
+    }
+
+    /// Rebuild the list of editing fields from the current `edited_host`.
+    /// This automatically excludes any fields that are now blank or set to null.
+    fn refresh_editing_fields(&mut self) {
+        if let Some(ref host) = self.edited_host {
+            let mut fields = host.iter_fields();
+            fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            self.editing_fields = fields
+                .into_iter()
+                // Convert the field name from snake_case to PascalCase.
+                .map(|(field, value)| (to_pascal_case(&field), value.into()))
+                .collect();
+            if self.edit_field_index >= self.editing_fields.len() {
+                self.edit_field_index = 0;
             }
         }
     }
@@ -721,4 +742,17 @@ fn render_right_footer(f: &mut Frame, app: &App, area: Rect) {
             .border_type(BorderType::Rounded),
     );
     f.render_widget(right_help, area);
+}
+
+fn to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            // Capitalize the first character and leave the rest unchanged.
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
