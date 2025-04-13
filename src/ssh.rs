@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use handlebars::Handlebars;
 use itertools::Itertools;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq, Deserialize)]
 pub struct Host {
     pub add_keys_to_agent: Option<String>,
     pub address_family: Option<String>,
