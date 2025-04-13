@@ -312,6 +312,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             visual_host_key: host.get(&ssh_config::EntryType::VisualHostKey),
             x_auth_location: host.get(&ssh_config::EntryType::XAuthLocation),
         })
+        .filter(|h| h.name != ".host")
         .collect::<Vec<Host>>();
 
     Ok(hosts)
@@ -329,78 +330,87 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
 /// Returns an error if the config file cannot be read or written.
 pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
     let path = Path::new(config_path);
-    let mut existing_blocks = Vec::new();
-    let mut current_block = Vec::new();
-    let mut inside_target_block = false;
+    let mut existing_blocks: Vec<Vec<String>> = Vec::new();
+    let mut current_block: Vec<String> = Vec::new();
 
-    // If the file exists, read and parse existing blocks
+    // Read the file and accumulate blocks.
     if path.exists() {
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
-
         for line in reader.lines() {
             let line = line?;
+            // A new block starts when a line starts with "host " (case-insensitive).
             if line.trim_start().to_lowercase().starts_with("host ") {
                 if !current_block.is_empty() {
                     existing_blocks.push(current_block);
                     current_block = Vec::new();
                 }
-                inside_target_block = line
-                    .split_whitespace()
-                    .skip(1)
-                    .any(|pattern| pattern == host.name);
             }
-            if inside_target_block {
-                // Skip lines in the target block — we'll replace it
-                continue;
-            } else {
+            // Only include nonblank lines.
+            if !line.trim().is_empty() {
                 current_block.push(line);
             }
         }
-
         if !current_block.is_empty() {
             existing_blocks.push(current_block);
         }
     }
 
-    // Append updated/new block for the given host
-    let new_block = format_host_block(host);
-    existing_blocks.push(new_block);
+    // Look for an existing block that matches the host name.
+    let mut target_index: Option<usize> = None;
+    for (i, block) in existing_blocks.iter().enumerate() {
+        if let Some(first_line) = block.get(0) {
+            if first_line.trim_start().to_lowercase().starts_with("host ") {
+                let tokens: Vec<&str> = first_line.split_whitespace().collect();
+                // Assume the first token is "Host" and the second is the primary name.
+                if tokens.len() > 1 && tokens[1] == host.name {
+                    target_index = Some(i);
+                    break;
+                }
+            }
+        }
+    }
 
-    // Write back all blocks
+    let new_block = format_host_block(host);
+    if let Some(i) = target_index {
+        existing_blocks[i] = new_block;
+    } else {
+        existing_blocks.push(new_block);
+    }
+
+    // Write back all blocks with exactly one blank line in between.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(path)?;
-
-    for block in existing_blocks {
+    for (i, block) in existing_blocks.iter().enumerate() {
         for line in block {
-            writeln!(file, "{line}")?;
+            writeln!(file, "{}", line)?;
         }
-        writeln!(file)?; // blank line between blocks
+        if i < existing_blocks.len() - 1 {
+            writeln!(file)?;
+        }
     }
 
     Ok(())
 }
 
-/// Convert a Host into lines of SSH config (Vec<String>)
+/// Convert a Host into lines of SSH config (Vec<String>).
 fn format_host_block(host: &Host) -> Vec<String> {
     let mut lines = vec![format!("Host {}", host.name)];
-
     for (key, value) in host.iter_fields() {
         if key != "name" && key != "aliases" {
             let ssh_key = format_ssh_key(&key);
-            lines.push(format!("  {} {}", ssh_key, value));
+            // Use exactly four spaces for indentation.
+            lines.push(format!("    {} {}", ssh_key, value));
         }
     }
-
     lines
 }
 
-/// Convert snake_case field names into SSH config-style names
+/// Convert snake_case field names into SSH config-style names.
 fn format_ssh_key(field: &str) -> String {
-    // Convert to TitleCase with dashes replaced by nothing
     field
         .split('_')
         .map(|s| {

@@ -113,8 +113,6 @@ impl App {
         if config.sort_by_name {
             hosts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
-        // Filter out hosts with an empty name or a name equal to ".host"
-        hosts.retain(|h| !h.name.trim().is_empty() && h.name != ".host");
 
         let search_input = config.search_filter.clone().unwrap_or_default();
         let matcher = SkimMatcherV2::default();
