@@ -722,6 +722,7 @@ dependencies = [
  "ratatui",
  "regex",
  "serde",
+ "serde_json",
  "shellexpand",
  "shlex",
  "strum",
