@@ -25,7 +25,14 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{searchable::Searchable, ssh};
 
-const INFO_TEXT: &str = "(Esc) quit | (↑) move up | (↓) move down | (enter) select";
+const INFO_TEXT: &str = "(Esc) quit | (↑/↓) move | (Tab) toggle focus | (enter) act";
+
+// Define focus state for the app.
+#[derive(PartialEq)]
+enum Focus {
+    Table,
+    Form,
+}
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -51,6 +58,17 @@ pub struct App {
     table_columns_constraints: Vec<Constraint>,
 
     palette: tailwind::Palette,
+
+    // New fields for editing mode.
+    focus: Focus,
+    /// Holds a clone of the host currently being edited.
+    edited_host: Option<ssh::Host>,
+    /// List of editable fields as (Field Name, Input widget).
+    editing_fields: Vec<(String, Input)>,
+    /// Which field is currently selected for editing.
+    edit_field_index: usize,
+    /// Remember the last table index we loaded into the form
+    last_selected_index: Option<usize>,
 }
 
 #[derive(PartialEq)]
@@ -94,7 +112,7 @@ impl App {
         let search_input = config.search_filter.clone().unwrap_or_default();
         let matcher = SkimMatcherV2::default();
 
-        let mut app = App {
+        let app = App {
             config: config.clone(),
 
             search: search_input.clone().into(),
@@ -113,10 +131,65 @@ impl App {
                         || matcher.fuzzy_match(&host.aliases, search_value).is_some()
                 },
             ),
+            // Start in table focus
+            focus: Focus::Table,
+            edited_host: None,
+            editing_fields: Vec::new(),
+            edit_field_index: 0,
+            last_selected_index: None,
         };
+
+        let mut app = app;
         app.calculate_table_columns_constraints();
 
         Ok(app)
+    }
+
+    /// Helper to load the current selected host into the editing form.
+    fn load_editing_fields(&mut self) {
+        if let Some(selected) = self.table_state.selected() {
+            if selected < self.hosts.len() {
+                // Only reload if selection changed.
+                if let Some(last) = self.last_selected_index {
+                    if last == selected {
+                        return;
+                    }
+                }
+                self.last_selected_index = Some(selected);
+                let host = &self.hosts[selected];
+                self.edited_host = Some(host.clone());
+                self.editing_fields.clear();
+
+                // Here we choose a subset of editable fields.
+                // You can expand this list as needed.
+                if let Some(ref host) = self.edited_host {
+                    let name_input: Input = host.name.clone().into();
+                    self.editing_fields.push(("Name".to_string(), name_input));
+
+                    let aliases_input: Input = host.aliases.clone().into();
+                    self.editing_fields
+                        .push(("Aliases".to_string(), aliases_input));
+
+                    let user_input: Input = host.user.clone().unwrap_or_default().into();
+                    self.editing_fields.push(("User".to_string(), user_input));
+
+                    let hostname_input: Input = host.hostname.clone().into();
+                    self.editing_fields
+                        .push(("Hostname".to_string(), hostname_input));
+
+                    let port_input: Input = host.port.clone().unwrap_or_default().into();
+                    self.editing_fields.push(("Port".to_string(), port_input));
+
+                    let proxy_input: Input = host.proxy_command.clone().unwrap_or_default().into();
+                    self.editing_fields
+                        .push(("ProxyCommand".to_string(), proxy_input));
+                }
+                // Append a "Save" button entry.
+                self.editing_fields
+                    .push(("Save".to_string(), Input::default()));
+                self.edit_field_index = 0;
+            }
+        }
     }
 
     /// # Errors
@@ -151,24 +224,24 @@ impl App {
             let ev = event::read()?;
 
             if let Event::Key(key) = ev {
-                if key.kind == KeyEventKind::Press {
-                    let action = self.on_key_press(terminal, key)?;
-                    match action {
-                        AppKeyAction::Ok => continue,
-                        AppKeyAction::Stop => break,
-                        AppKeyAction::Continue => {}
-                    }
+                let action = self.on_key_press(terminal, key)?;
+                match action {
+                    AppKeyAction::Ok => {}
+                    AppKeyAction::Stop => break,
+                    AppKeyAction::Continue => {}
                 }
+                // When in table mode, update the search and table.
+                if self.focus == Focus::Table {
+                    self.search.handle_event(&Event::Key(key));
+                    self.hosts.search(self.search.value());
 
-                self.search.handle_event(&ev);
-                self.hosts.search(self.search.value());
-
-                let selected = self.table_state.selected().unwrap_or(0);
-                if selected >= self.hosts.len() {
-                    self.table_state.select(Some(match self.hosts.len() {
-                        0 => 0,
-                        _ => self.hosts.len() - 1,
-                    }));
+                    let selected = self.table_state.selected().unwrap_or(0);
+                    if selected >= self.hosts.len() {
+                        self.table_state.select(Some(match self.hosts.len() {
+                            0 => 0,
+                            _ => self.hosts.len() - 1,
+                        }));
+                    }
                 }
             }
         }
@@ -187,63 +260,157 @@ impl App {
         #[allow(clippy::enum_glob_use)]
         use KeyCode::*;
 
-        let is_ctrl_pressed = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        if is_ctrl_pressed {
-            let action = self.on_key_press_ctrl(key);
-            if action != AppKeyAction::Continue {
-                return Ok(action);
-            }
-        }
-
-        match key.code {
-            Esc => return Ok(AppKeyAction::Stop),
-            Down => self.next(),
-            Up => self.previous(),
-            Home => self.table_state.select(Some(0)),
-            End => self.table_state.select(Some(self.hosts.len() - 1)),
-            PageDown => {
-                let i = self.table_state.selected().unwrap_or(0);
-                let target = min(i.saturating_add(21), self.hosts.len() - 1);
-
-                self.table_state.select(Some(target));
-            }
-            PageUp => {
-                let i = self.table_state.selected().unwrap_or(0);
-                let target = max(i.saturating_sub(21), 0);
-
-                self.table_state.select(Some(target));
-            }
-            Enter => {
-                let selected = self.table_state.selected().unwrap_or(0);
-                if selected >= self.hosts.len() {
+        match self.focus {
+            Focus::Table => {
+                if key.code == Tab {
+                    self.load_editing_fields();
+                    self.focus = Focus::Form;
                     return Ok(AppKeyAction::Ok);
                 }
 
-                let host: &ssh::Host = &self.hosts[selected];
+                let is_ctrl_pressed = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                restore_terminal(terminal).expect("Failed to restore terminal");
-
-                if let Some(template) = &self.config.command_template_on_session_start {
-                    host.run_command_template(template)?;
+                if is_ctrl_pressed {
+                    let action = self.on_key_press_ctrl(key);
+                    if action != AppKeyAction::Continue {
+                        return Ok(action);
+                    }
                 }
 
-                host.run_command_template(&self.config.command_template)?;
+                match key.code {
+                    Esc => return Ok(AppKeyAction::Stop),
+                    Down => self.next(),
+                    Up => self.previous(),
+                    Home => self.table_state.select(Some(0)),
+                    End => self.table_state.select(Some(self.hosts.len() - 1)),
+                    PageDown => {
+                        let i = self.table_state.selected().unwrap_or(0);
+                        let target = min(i.saturating_add(21), self.hosts.len() - 1);
+                        self.table_state.select(Some(target));
+                    }
+                    PageUp => {
+                        let i = self.table_state.selected().unwrap_or(0);
+                        let target = max(i.saturating_sub(21), 0);
+                        self.table_state.select(Some(target));
+                    }
+                    Enter => {
+                        let selected = self.table_state.selected().unwrap_or(0);
+                        if selected >= self.hosts.len() {
+                            return Ok(AppKeyAction::Ok);
+                        }
 
-                if let Some(template) = &self.config.command_template_on_session_end {
-                    host.run_command_template(template)?;
+                        let host: &ssh::Host = &self.hosts[selected];
+
+                        restore_terminal(terminal).expect("Failed to restore terminal");
+
+                        if let Some(template) = &self.config.command_template_on_session_start {
+                            host.run_command_template(template)?;
+                        }
+
+                        host.run_command_template(&self.config.command_template)?;
+
+                        if let Some(template) = &self.config.command_template_on_session_end {
+                            host.run_command_template(template)?;
+                        }
+
+                        setup_terminal(terminal).expect("Failed to setup terminal");
+
+                        if self.config.exit_after_ssh_session_ends {
+                            return Ok(AppKeyAction::Stop);
+                        }
+                    }
+                    _ => return Ok(AppKeyAction::Continue),
                 }
-
-                setup_terminal(terminal).expect("Failed to setup terminal");
-
-                if self.config.exit_after_ssh_session_ends {
-                    return Ok(AppKeyAction::Stop);
-                }
+                Ok(AppKeyAction::Ok)
             }
-            _ => return Ok(AppKeyAction::Continue),
+            Focus::Form => {
+                match key.code {
+                    Tab => {
+                        // Switch back to table focus.
+                        self.focus = Focus::Table;
+                    }
+                    Up => {
+                        if self.edit_field_index == 0 {
+                            self.edit_field_index = self.editing_fields.len() - 1;
+                        } else {
+                            self.edit_field_index -= 1;
+                        }
+                    }
+                    Down => {
+                        self.edit_field_index =
+                            (self.edit_field_index + 1) % self.editing_fields.len();
+                    }
+                    Enter => {
+                        // If the current field is "Save", then commit the changes.
+                        if self.editing_fields[self.edit_field_index].0 == "Save" {
+                            if let Some(ref mut edited_host) = self.edited_host {
+                                // Update the edited_host with values from the input widgets.
+                                for (field, input) in &self.editing_fields {
+                                    let val = input.value();
+                                    match field.as_str() {
+                                        "Name" => edited_host.name = val.to_string(),
+                                        "Aliases" => edited_host.aliases = val.to_string(),
+                                        "User" => {
+                                            edited_host.user = if val.is_empty() {
+                                                None
+                                            } else {
+                                                Some(val.to_string())
+                                            }
+                                        }
+                                        "Hostname" => edited_host.hostname = val.to_string(),
+                                        "Port" => {
+                                            edited_host.port = if val.is_empty() {
+                                                None
+                                            } else {
+                                                Some(val.to_string())
+                                            }
+                                        }
+                                        "ProxyCommand" => {
+                                            edited_host.proxy_command = if val.is_empty() {
+                                                None
+                                            } else {
+                                                Some(val.to_string())
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // Save the updated host back to disk.
+                                let home = env::var("HOME").expect("HOME not set");
+                                let config_path = format!("{}/.ssh/config", home);
+                                match ssh::save_config(edited_host, &config_path) {
+                                    Ok(()) => {
+                                        if let Some(selected) = self.table_state.selected() {
+                                            if let Some(host) = self.hosts.get_mut(selected) {
+                                                *host = edited_host.clone();
+                                                self.hosts.search(self.search.value());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("Error saving host: {:?}", e);
+                                    }
+                                }
+                            }
+                            // Switch focus back to table after saving.
+                            self.focus = Focus::Table;
+                        } else {
+                            // For normal text fields, let the input widget process the event.
+                            self.editing_fields[self.edit_field_index]
+                                .1
+                                .handle_event(&Event::Key(key));
+                        }
+                    }
+                    _ => {
+                        // For all other keys, pass the event to the current input widget.
+                        self.editing_fields[self.edit_field_index]
+                            .1
+                            .handle_event(&Event::Key(key));
+                    }
+                }
+                Ok(AppKeyAction::Ok)
+            }
         }
-
-        Ok(AppKeyAction::Ok)
     }
 
     fn on_key_press_ctrl(&mut self, key: KeyEvent) -> AppKeyAction {
@@ -372,6 +539,7 @@ impl App {
                 .skip(1)
                 .map(|len| Constraint::Min(u16::try_from(*len).unwrap_or_default() + 1)),
         );
+        self.table_columns_constraints = new_constraints;
     }
 }
 
@@ -413,22 +581,12 @@ where
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    // Parse ~/.ssh/config file
-    let home = env::var("HOME").expect("HOME not set");
-    let config_path = format!("{}/.ssh/config", home);
-    let parsed_hosts = ssh::parse_config(&config_path).unwrap_or_default();
-    let host_map: HashMap<String, ssh::Host> = parsed_hosts
-        .into_iter()
-        .map(|host| (host.name.clone(), host))
-        .collect();
-
-    // Split the screen horizontally into left and right halves.
+    // Left side remains the same.
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
         .split(f.size());
 
-    // Left side: existing vertical layout.
     let left_rects = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
@@ -440,41 +598,47 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_table(f, app, left_rects[1]);
     render_footer(f, app, left_rects[2]);
 
-    // Right side: display selected host configuration.
-    let config_text = if let Some(selected) = app.table_state.selected() {
-        if selected < app.hosts.len() {
-            let selected_host_name = &app.hosts[selected].name;
-            if let Some(host) = host_map.get(selected_host_name) {
-                // Use the helper method to iterate over (key, value) pairs.
-                host.iter_fields()
-                    .into_iter()
-                    .map(|(key, value)| format!("{}: {}\n", key, value))
-                    .collect::<String>()
+    // On the right, display the editable configuration form.
+    // Now, update the form whenever we're in table (preview) mode so that up/down navigation changes the form.
+    if app.focus == Focus::Table {
+        app.load_editing_fields();
+    }
+
+    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    let form_items: Vec<ListItem> = app
+        .editing_fields
+        .iter()
+        .enumerate()
+        .map(|(i, (field, input))| {
+            let content = if field == "Save" {
+                format!("[ Save ]")
             } else {
-                "Host not found in map".to_string()
-            }
-        } else {
-            "No host selected".to_string()
-        }
-    } else {
-        "No host selected".to_string()
-    };
+                format!("{}: {}", field, input.value())
+            };
+            let style = if app.focus == Focus::Form && i == app.edit_field_index {
+                selected_style
+            } else {
+                Style::default()
+            };
+            ListItem::new(content).style(style)
+        })
+        .collect();
 
-    let config_paragraph = Paragraph::new(config_text)
-        .block(
-            Block::default()
-                .title("Configuration")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(config_paragraph, horizontal_chunks[1]);
-
-    // Position the cursor on the left side as before.
-    f.set_cursor(
-        left_rects[0].x + u16::try_from(app.search.cursor()).unwrap_or_default() + 4,
-        left_rects[0].y + 1,
+    let form_list = List::new(form_items).block(
+        Block::default()
+            .title("Configuration (Edit)")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded),
     );
+    f.render_widget(form_list, horizontal_chunks[1]);
+
+    // When the focus is on the table, set the cursor in the searchbar as before.
+    if app.focus == Focus::Table {
+        f.set_cursor(
+            left_rects[0].x + u16::try_from(app.search.cursor()).unwrap_or_default() + 4,
+            left_rects[0].y + 1,
+        );
+    }
 }
 
 fn render_searchbar(f: &mut Frame, app: &mut App, area: Rect) {

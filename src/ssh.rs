@@ -3,10 +3,13 @@ use handlebars::Handlebars;
 use itertools::Itertools;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::Command;
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct Host {
     pub add_keys_to_agent: Option<String>,
     pub address_family: Option<String>,
@@ -312,4 +315,101 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
         .collect::<Vec<Host>>();
 
     Ok(hosts)
+}
+
+/// Save or update a Host config entry in the given SSH config file.
+///
+/// # Arguments
+///
+/// * `host` - The host entry to save.
+/// * `config_path` - The path to the SSH config file.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or written.
+pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
+    let path = Path::new(config_path);
+    let mut existing_blocks = Vec::new();
+    let mut current_block = Vec::new();
+    let mut inside_target_block = false;
+
+    // If the file exists, read and parse existing blocks
+    if path.exists() {
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim_start().to_lowercase().starts_with("host ") {
+                if !current_block.is_empty() {
+                    existing_blocks.push(current_block);
+                    current_block = Vec::new();
+                }
+                inside_target_block = line
+                    .split_whitespace()
+                    .skip(1)
+                    .any(|pattern| pattern == host.name);
+            }
+            if inside_target_block {
+                // Skip lines in the target block — we'll replace it
+                continue;
+            } else {
+                current_block.push(line);
+            }
+        }
+
+        if !current_block.is_empty() {
+            existing_blocks.push(current_block);
+        }
+    }
+
+    // Append updated/new block for the given host
+    let new_block = format_host_block(host);
+    existing_blocks.push(new_block);
+
+    // Write back all blocks
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+
+    for block in existing_blocks {
+        for line in block {
+            writeln!(file, "{line}")?;
+        }
+        writeln!(file)?; // blank line between blocks
+    }
+
+    Ok(())
+}
+
+/// Convert a Host into lines of SSH config (Vec<String>)
+fn format_host_block(host: &Host) -> Vec<String> {
+    let mut lines = vec![format!("Host {}", host.name)];
+
+    for (key, value) in host.iter_fields() {
+        if key != "name" && key != "aliases" {
+            let ssh_key = format_ssh_key(&key);
+            lines.push(format!("  {} {}", ssh_key, value));
+        }
+    }
+
+    lines
+}
+
+/// Convert snake_case field names into SSH config-style names
+fn format_ssh_key(field: &str) -> String {
+    // Convert to TitleCase with dashes replaced by nothing
+    field
+        .split('_')
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
