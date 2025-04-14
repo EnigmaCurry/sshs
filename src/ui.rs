@@ -1,9 +1,11 @@
+use crate::log::log_error;
+use crate::ssh::ensure_user_ssh_config;
+use crate::{searchable::Searchable, ssh};
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -16,15 +18,13 @@ use std::collections::HashSet;
 use std::{
     cell::RefCell,
     cmp::{max, min},
-    env, io,
+    io,
     rc::Rc,
 };
 use style::palette::tailwind;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
-
-use crate::{searchable::Searchable, ssh};
 
 // Separate help messages for left and right sides.
 const LEFT_HELP_MSG: &str =
@@ -156,6 +156,22 @@ impl App {
         Ok(app)
     }
 
+    // Add this function to the App impl
+    fn has_changes(&self) -> bool {
+        if let Some(edited_host) = &self.edited_host {
+            if let Some(selected) = self.table_state.selected() {
+                if selected < self.hosts.len() {
+                    // Convert both to JSON to compare them more easily
+                    let original_json =
+                        serde_json::to_value(&self.hosts[selected]).unwrap_or_default();
+                    let edited_json = serde_json::to_value(edited_host).unwrap_or_default();
+                    return original_json != edited_json;
+                }
+            }
+        }
+        false
+    }
+
     fn load_editing_fields(&mut self) {
         if let Some(selected) = self.table_state.selected() {
             if selected < self.hosts.len() {
@@ -183,54 +199,81 @@ impl App {
     }
 
     fn commit_field(&mut self) {
-        // Build a new updated host from the current edited_host.
-        let new_host = if let Some(edited_host) = self.edited_host.as_mut() {
-            // Serialize the host into a JSON value.
-            let mut host_value =
-                serde_json::to_value(edited_host).expect("Failed to serialize host");
+        // Only proceed if we have an edited host
+        if let Some(edited_host) = self.edited_host.as_mut() {
+            // Serialize the host to get its current state
+            let mut host_value = match serde_json::to_value(&mut *edited_host) {
+                Ok(value) => value,
+                Err(e) => {
+                    log_error(&format!("Failed to serialize host: {}", e));
+                    return;
+                }
+            };
+
+            // Only proceed if the host was serialized as an object
             if let serde_json::Value::Object(ref mut map) = host_value {
-                // For each editable field, update the value.
-                for (field, input) in &self.editing_fields {
-                    let new_val = if input.value().is_empty() {
-                        // For the "aliases" field, store an empty string instead of null.
-                        if field == "aliases" {
-                            serde_json::Value::String(String::new())
+                // Update each field based on the current input values
+                for (field_name, input) in &self.editing_fields {
+                    let snake_case_field = to_snake_case(field_name);
+                    let value = input.value().to_string();
+
+                    // Set the value in the JSON map
+                    if value.is_empty() {
+                        // For empty values, use null except for "aliases" which should remain as empty string
+                        if snake_case_field == "aliases" {
+                            map.insert(snake_case_field, serde_json::Value::String(String::new()));
                         } else {
-                            serde_json::Value::Null
+                            map.insert(snake_case_field, serde_json::Value::Null);
                         }
                     } else {
-                        serde_json::Value::String(input.value().to_string())
-                    };
-                    map.insert(field.clone(), new_val);
+                        map.insert(snake_case_field, serde_json::Value::String(value));
+                    }
+                }
+
+                // Deserialize back to a Host struct
+                match serde_json::from_value::<ssh::Host>(host_value) {
+                    Ok(updated_host) => {
+                        // Update the edited host
+                        *edited_host = updated_host.clone();
+
+                        // Check if there are any actual changes
+                        if self.has_changes() {
+                            // If we're editing an existing host, update it in the hosts list
+                            if let Some(selected) = self.table_state.selected() {
+                                if selected < self.hosts.len() {
+                                    // Get a mutable reference to the original entry
+                                    if let Some(host_entry) = self.hosts.get_mut(selected) {
+                                        // Update the entry with our edited version
+                                        *host_entry = updated_host.clone();
+
+                                        // Always save to ~/.ssh/config
+                                        let user_config = ensure_user_ssh_config();
+
+                                        if let Err(e) = ssh::save_config(host_entry, &user_config) {
+                                            log_error(&format!("Failed to save config: {}", e));
+                                        }
+
+                                        // After saving, we need to reload the search to update both
+                                        // the filtered and unfiltered views in the Searchable container
+                                        self.hosts.search(self.search.value());
+
+                                        // Make sure our last_selected_index is reset so that the form
+                                        // will be reloaded from the hosts list the next time
+                                        self.last_selected_index = None;
+
+                                        // Reload all form fields to ensure we have the latest values
+                                        self.load_editing_fields();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log deserialization error
+                        log_error(&format!("Failed to update host: {}", e));
+                    }
                 }
             }
-            // Deserialize the updated JSON back into a host.
-            serde_json::from_value(host_value).expect("Failed to deserialize host")
-        } else {
-            return;
-        };
-
-        // Reassign the updated host to self.edited_host.
-        self.edited_host = Some(new_host);
-
-        // Now, refresh the editing fields since the host has been updated.
-        self.refresh_editing_fields();
-
-        // Update the host list and save changes to disk.
-        if let Some(selected) = self.table_state.selected() {
-            if let Some(host) = self.hosts.get_mut(selected) {
-                if let Some(ref edited_host) = self.edited_host {
-                    *host = edited_host.clone();
-                    self.hosts.search(self.search.value());
-                }
-            }
-        }
-
-        let home = std::env::var("HOME").expect("HOME not set");
-        let config_path = format!("{}/.ssh/config", home);
-        match ssh::save_config(self.edited_host.as_ref().unwrap(), &config_path) {
-            Ok(()) => { /* Successfully saved */ }
-            Err(e) => println!("Error saving host: {:?}", e),
         }
     }
 
@@ -909,6 +952,21 @@ fn to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 pub struct AddFieldModal {

@@ -1,11 +1,10 @@
+use crate::log::log_error;
 use anyhow::anyhow;
 use handlebars::Handlebars;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
@@ -329,7 +328,61 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
 ///
 /// Returns an error if the config file cannot be read or written.
 pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
     let path = Path::new(config_path);
+
+    // Check file and directory permissions before attempting to write
+    if path.exists() {
+        // Check if we can read the file
+        match File::open(path) {
+            Ok(_) => {} // We can read the file
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot read SSH config file: {} - {}",
+                    config_path,
+                    e
+                ))
+            }
+        }
+
+        // Check if the file is writable
+        match OpenOptions::new().write(true).open(path) {
+            Ok(_) => {} // We can write to the file
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot write to SSH config file: {} - {}",
+                    config_path,
+                    e
+                ))
+            }
+        }
+    } else {
+        // Check if the parent directory exists and is writable
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                return Err(anyhow::anyhow!(
+                    "Parent directory doesn't exist: {}",
+                    parent.display()
+                ));
+            }
+
+            match OpenOptions::new().write(true).open(parent) {
+                Ok(_) => {} // We can write to the directory
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot write to directory: {} - {}",
+                        parent.display(),
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
     let mut existing_blocks: Vec<Vec<String>> = Vec::new();
     let mut current_block: Vec<String> = Vec::new();
 
@@ -378,20 +431,46 @@ pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
         existing_blocks.push(new_block);
     }
 
-    // Write back all blocks with exactly one blank line in between.
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+    // Try to use a safer approach: write to a temporary file first
+    let temp_path = format!("{}.tmp", config_path);
+    let temp_file_path = Path::new(&temp_path);
+
+    // Create the temp file with the same permissions as the original
+    let mut file_options = OpenOptions::new();
+    file_options.create(true).write(true).truncate(true);
+
+    // If the original file exists, copy its permissions
+    if path.exists() {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            file_options.mode(mode);
+        }
+    } else {
+        // Default permissions for new SSH config: 0600 (user read/write only)
+        file_options.mode(0o600);
+    }
+
+    let mut temp_file = file_options
+        .open(temp_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create temporary file: {} - {}", temp_path, e))?;
+
+    // Write all blocks to the temp file
     for (i, block) in existing_blocks.iter().enumerate() {
         for line in block {
-            writeln!(file, "{}", line)?;
+            writeln!(temp_file, "{}", line)?;
         }
         if i < existing_blocks.len() - 1 {
-            writeln!(file)?;
+            writeln!(temp_file)?;
         }
     }
+
+    // Ensure all data is written
+    temp_file.flush()?;
+    drop(temp_file);
+
+    // Now rename the temp file to the actual file (atomic operation)
+    fs::rename(temp_file_path, path)
+        .map_err(|e| anyhow::anyhow!("Failed to save config file: {} - {}", config_path, e))?;
 
     Ok(())
 }
@@ -456,4 +535,63 @@ pub fn get_all_host_fields() -> Vec<String> {
     } else {
         vec![]
     }
+}
+
+/// Ensures the user's SSH config file exists and returns its path
+pub fn ensure_user_ssh_config() -> String {
+    use std::fs::create_dir_all;
+
+    // Get user's home directory
+    let home_dir = dirs::home_dir().expect("Could not determine home directory");
+    let ssh_dir = home_dir.join(".ssh");
+    let config_path = ssh_dir.join("config");
+
+    // Ensure .ssh directory exists
+    if !ssh_dir.exists() {
+        if let Err(e) = create_dir_all(&ssh_dir) {
+            log_error(&format!("Failed to create .ssh directory: {}", e));
+            return config_path.to_string_lossy().to_string();
+        }
+
+        // Set proper permissions on .ssh directory (0700 - only user can read/write/execute)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+            {
+                log_error(&format!(
+                    "Failed to set permissions on .ssh directory: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    // Create config file if it doesn't exist
+    if !config_path.exists() {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&config_path)
+        {
+            log_error(&format!("Failed to create SSH config file: {}", e));
+        } else {
+            // Set proper permissions on config file (0600 - only user can read/write)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    log_error(&format!(
+                        "Failed to set permissions on SSH config file: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    config_path.to_string_lossy().to_string()
 }
