@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
-#[derive(Debug, Serialize, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Serialize, Clone, PartialEq, Deserialize)]
 pub struct Host {
     pub add_keys_to_agent: Option<String>,
     pub address_family: Option<String>,
@@ -446,4 +446,14 @@ fn format_ssh_key(field: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+pub fn get_all_host_fields() -> Vec<String> {
+    let dummy_host = Host::default();
+    let json_val = serde_json::to_value(dummy_host).unwrap();
+    if let serde_json::Value::Object(map) = json_val {
+        map.keys().cloned().collect()
+    } else {
+        vec![]
+    }
 }

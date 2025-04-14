@@ -9,6 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use ratatui::widgets::Clear;
 #[allow(clippy::wildcard_imports)]
 use ratatui::{prelude::*, widgets::*};
 use std::collections::HashMap;
@@ -60,7 +61,7 @@ pub struct App {
     table_state: TableState,
     hosts: Searchable<ssh::Host>,
     table_columns_constraints: Vec<Constraint>,
-
+    add_field_modal: Option<AddFieldModal>,
     palette: tailwind::Palette,
 
     // New fields for editing mode.
@@ -121,7 +122,7 @@ impl App {
             config: config.clone(),
 
             search: search_input.clone().into(),
-
+            add_field_modal: None,
             table_state: TableState::default().with_selected(0),
             table_columns_constraints: Vec::new(),
             palette: tailwind::BLUE,
@@ -286,8 +287,9 @@ impl App {
                     AppKeyAction::Ok => {}
                     AppKeyAction::Stop => break,
                     AppKeyAction::Continue => {}
-                } // When in table mode, update the search and table.
-                if self.focus == Focus::Table {
+                }
+                // Only update search if no modal is active.
+                if self.focus == Focus::Table && self.add_field_modal.is_none() {
                     self.search.handle_event(&Event::Key(key));
                     self.hosts.search(self.search.value());
 
@@ -314,6 +316,56 @@ impl App {
         B: Backend + io::Write,
     {
         use KeyCode::*;
+
+        // If the modal is active, handle its keys and return.
+        if let Some(ref mut modal) = self.add_field_modal {
+            match key.code {
+                Enter => {
+                    if !modal.filtered_fields.is_empty() {
+                        // Grab the chosen field (in snake_case).
+                        let chosen_field = modal.filtered_fields[modal.selected_index].clone();
+                        // Update the host: insert the new field with an empty value.
+                        if let Some(ref mut host) = self.edited_host {
+                            let mut host_value =
+                                serde_json::to_value(&mut *host).expect("Failed to serialize host");
+                            if let serde_json::Value::Object(ref mut map) = host_value {
+                                map.entry(chosen_field.clone())
+                                    .or_insert(serde_json::Value::String(String::new()));
+                            }
+                            *host =
+                                serde_json::from_value(host_value).expect("Failed to update host");
+                        }
+                        // Refresh the editing view.
+                        self.refresh_editing_fields();
+                        // Set the edit_field_index to the newly added field (using PascalCase).
+                        if let Some(idx) = self
+                            .editing_fields
+                            .iter()
+                            .position(|(f, _)| f == &to_pascal_case(&chosen_field))
+                        {
+                            self.edit_field_index = idx;
+                        }
+                        // Immediately start editing that field.
+                        self.in_field_edit = true;
+                    }
+                    // Dismiss the modal.
+                    self.add_field_modal = None;
+                    return Ok(AppKeyAction::Ok);
+                }
+                Esc => {
+                    // Cancel the modal.
+                    self.add_field_modal = None;
+                    return Ok(AppKeyAction::Ok);
+                }
+                _ => {
+                    // Delegate all other keys to the modal.
+                    modal.handle_event(key);
+                    return Ok(AppKeyAction::Ok);
+                }
+            }
+        }
+
+        // No modal active—continue with the normal event handling:
         match self.focus {
             Focus::Table => {
                 if key.code == Tab {
@@ -329,7 +381,6 @@ impl App {
                     }
                 }
                 match key.code {
-                    // ESC is globally handled above.
                     Down => self.next(),
                     Up => self.previous(),
                     Home => self.table_state.select(Some(0)),
@@ -369,10 +420,8 @@ impl App {
                 Ok(AppKeyAction::Ok)
             }
             Focus::Form => {
-                // Global ESC check already happens.
                 match key.code {
                     Tab => {
-                        // Switch back to table mode.
                         if self.in_field_edit {
                             self.commit_field();
                             self.in_field_edit = false;
@@ -404,13 +453,22 @@ impl App {
                     }
                     Enter => {
                         if self.in_field_edit {
-                            // Exiting field edit mode commits the change.
                             self.commit_field();
                             self.in_field_edit = false;
                         } else {
-                            // Enter editing mode for the current field.
                             self.in_field_edit = true;
                         }
+                    }
+                    // Open modal with 'a' when not editing:
+                    KeyCode::Char('a') => {
+                        let existing_fields: Vec<String> = if let Some(ref host) = self.edited_host
+                        {
+                            host.iter_fields().into_iter().map(|(k, _)| k).collect()
+                        } else {
+                            vec![]
+                        };
+                        self.add_field_modal = Some(AddFieldModal::new(&existing_fields));
+                        return Ok(AppKeyAction::Ok);
                     }
                     _ => {
                         if self.in_field_edit {
@@ -656,8 +714,73 @@ fn ui(f: &mut Frame, app: &mut App) {
             left_rects[0].y + 1,
         );
     }
+
+    // === Render the modal if it is active ===
+    if let Some(modal) = &app.add_field_modal {
+        // Use the new helper to set the modal height to 15 lines and width to 60% of the screen.
+        let modal_area = centered_rect(15, 60, f.size());
+
+        // Draw a clear widget to mask underlying content.
+        f.render_widget(Clear, modal_area);
+
+        // Calculate the available height for items inside the modal.
+        let available_height = modal_area.height.saturating_sub(2) as usize;
+        let total_items = modal.filtered_fields.len();
+
+        // Determine the scroll offset so that the selected item is always visible.
+        let scroll_offset =
+            if total_items > available_height && modal.selected_index >= available_height {
+                modal.selected_index - available_height + 1
+            } else {
+                0
+            };
+
+        // Calculate the slice of items that should be visible in the modal.
+        let end_index = (scroll_offset + available_height).min(total_items);
+        let visible_fields = &modal.filtered_fields[scroll_offset..end_index];
+
+        // Build list items for the visible slice.
+        let modal_items: Vec<ListItem> = visible_fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                let abs_index = i + scroll_offset;
+                let style = if abs_index == modal.selected_index {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(field.clone()).style(style)
+            })
+            .collect();
+
+        let modal_list = List::new(modal_items)
+            .block(
+                Block::default()
+                    .title("Add Field (Enter to select, Esc to cancel)")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .highlight_symbol(">> ");
+
+        f.render_widget(modal_list, modal_area);
+    }
 }
 
+/// Helper function to create a centered rectangle with the given width and height percentages.
+fn centered_rect(desired_height: u16, percent_x: u16, r: Rect) -> Rect {
+    use std::cmp::min;
+    let modal_height = min(desired_height, r.height);
+    let vertical_gap = (r.height.saturating_sub(modal_height)) / 2;
+    let modal_width = r.width * percent_x / 100;
+    let horizontal_gap = (r.width.saturating_sub(modal_width)) / 2;
+    Rect {
+        x: r.x + horizontal_gap,
+        y: r.y + vertical_gap,
+        width: modal_width,
+        height: modal_height,
+    }
+}
 fn render_searchbar(f: &mut Frame, app: &App, area: Rect) {
     let info = Paragraph::new(app.search.value()).block(
         Block::default()
@@ -755,4 +878,84 @@ fn to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+pub struct AddFieldModal {
+    /// Filter string input for the modal.
+    pub filter: Input,
+    /// Fields available for addition (derived from the Host struct).
+    pub available_fields: Vec<String>,
+    /// Filtered list based on the current filter value.
+    pub filtered_fields: Vec<String>,
+    /// The current selected index from the filtered list.
+    pub selected_index: usize,
+}
+
+impl AddFieldModal {
+    /// Create a new modal based on the list of existing fields already in the host.
+    pub fn new(existing_fields: &[String]) -> Self {
+        // Get all field names from the Host struct dynamically.
+        let all_fields = ssh::get_all_host_fields();
+        let available_fields: Vec<String> = all_fields
+            .into_iter()
+            .filter(|field| {
+                !existing_fields.contains(field)
+                    && field != "name"    // Exclude if always present.
+                    && field != "aliases" // Exclude if always shown.
+            })
+            .collect();
+
+        let mut modal = Self {
+            filter: "".into(),
+            available_fields,
+            filtered_fields: Vec::new(),
+            selected_index: 0,
+        };
+        modal.update_filtered();
+        modal
+    }
+
+    /// Update the filtered list using the current filter input.
+    pub fn update_filtered(&mut self) {
+        let filter_value = self.filter.value();
+        self.filtered_fields = self
+            .available_fields
+            .iter()
+            .filter(|f| filter_value.is_empty() || f.contains(filter_value))
+            .cloned()
+            .collect();
+
+        if self.selected_index >= self.filtered_fields.len() && !self.filtered_fields.is_empty() {
+            self.selected_index = 0;
+        }
+    }
+
+    /// Handle key events (up/down arrows for navigation and other keys for editing the filter).
+    pub fn handle_event(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Down => {
+                if !self.filtered_fields.is_empty() {
+                    self.selected_index = (self.selected_index + 1) % self.filtered_fields.len();
+                }
+                true
+            }
+            KeyCode::Up => {
+                if !self.filtered_fields.is_empty() {
+                    if self.selected_index == 0 {
+                        self.selected_index = self.filtered_fields.len() - 1;
+                    } else {
+                        self.selected_index -= 1;
+                    }
+                }
+                true
+            }
+            _ => {
+                // Pass other keys to the filter input.
+                self.filter.handle_event(&crossterm::event::Event::Key(key));
+                self.update_filtered();
+                true
+            }
+        }
+    }
 }
