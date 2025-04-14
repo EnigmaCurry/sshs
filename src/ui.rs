@@ -12,7 +12,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::widgets::Clear;
 #[allow(clippy::wildcard_imports)]
 use ratatui::{prelude::*, widgets::*};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::{
     cell::RefCell,
     cmp::{max, min},
@@ -76,6 +76,8 @@ pub struct App {
     last_selected_index: Option<usize>,
     /// Tracks whether the currently selected field is in active edit mode.
     in_field_edit: bool,
+
+    new_fields: HashSet<String>,
 }
 
 #[derive(PartialEq)]
@@ -144,6 +146,8 @@ impl App {
             edit_field_index: 0,
             last_selected_index: None,
             in_field_edit: false,
+
+            new_fields: HashSet::new(),
         };
 
         let mut app = app;
@@ -234,13 +238,33 @@ impl App {
     /// This automatically excludes any fields that are now blank or set to null.
     fn refresh_editing_fields(&mut self) {
         if let Some(ref host) = self.edited_host {
-            let mut fields = host.iter_fields();
+            // Serialize the host to JSON.
+            let host_value = serde_json::to_value(host).expect("Failed to serialize host");
+            let mut fields: Vec<(String, String)> = vec![];
+
+            if let serde_json::Value::Object(map) = host_value {
+                for (k, v) in map.into_iter() {
+                    // Convert the field value into a String.
+                    let value_str = match v {
+                        serde_json::Value::String(s) => s,
+                        _ => String::new(),
+                    };
+                    // Only include the field if it has a non‑blank value or is in the new_fields set.
+                    if !value_str.is_empty() || self.new_fields.contains(&k) {
+                        fields.push((k, value_str));
+                    }
+                }
+            }
+
+            // Sort fields for consistent ordering.
             fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+            // Convert each (field, value) pair into your editing field representation.
             self.editing_fields = fields
                 .into_iter()
-                // Convert the field name from snake_case to PascalCase.
-                .map(|(field, value)| (to_pascal_case(&field), value.into()))
+                .map(|(field, value)| (to_pascal_case(&field), Input::from(value)))
                 .collect();
+
             if self.edit_field_index >= self.editing_fields.len() {
                 self.edit_field_index = 0;
             }
@@ -318,26 +342,33 @@ impl App {
         use KeyCode::*;
 
         // If the modal is active, handle its keys and return.
+        // If the modal is active, handle its keys and return.
         if let Some(ref mut modal) = self.add_field_modal {
             match key.code {
                 Enter => {
                     if !modal.filtered_fields.is_empty() {
                         // Grab the chosen field (in snake_case).
                         let chosen_field = modal.filtered_fields[modal.selected_index].clone();
+
+                        // Record that this field was explicitly added.
+                        self.new_fields.insert(chosen_field.clone());
+
                         // Update the host: insert the new field with an empty value.
                         if let Some(ref mut host) = self.edited_host {
                             let mut host_value =
                                 serde_json::to_value(&mut *host).expect("Failed to serialize host");
                             if let serde_json::Value::Object(ref mut map) = host_value {
+                                // Only insert if not already present.
                                 map.entry(chosen_field.clone())
                                     .or_insert(serde_json::Value::String(String::new()));
                             }
                             *host =
                                 serde_json::from_value(host_value).expect("Failed to update host");
                         }
-                        // Refresh the editing view.
+                        // Refresh the editing fields list.
                         self.refresh_editing_fields();
-                        // Set the edit_field_index to the newly added field (using PascalCase).
+                        self.load_editing_fields();
+                        // Set the edit_field_index to the newly added field.
                         if let Some(idx) = self
                             .editing_fields
                             .iter()
@@ -345,10 +376,10 @@ impl App {
                         {
                             self.edit_field_index = idx;
                         }
-                        // Immediately start editing that field.
+                        // Switch focus to the form editing side.
+                        self.focus = Focus::Form;
                         self.in_field_edit = true;
                     }
-                    // Dismiss the modal.
                     self.add_field_modal = None;
                     return Ok(AppKeyAction::Ok);
                 }
@@ -460,7 +491,7 @@ impl App {
                         }
                     }
                     // Open modal with 'a' when not editing:
-                    KeyCode::Char('a') => {
+                    KeyCode::Char('a') if !self.in_field_edit => {
                         let existing_fields: Vec<String> = if let Some(ref host) = self.edited_host
                         {
                             host.iter_fields().into_iter().map(|(k, _)| k).collect()
