@@ -210,6 +210,15 @@ impl App {
                 }
             };
 
+            // Store the current field name being edited before we make changes
+            let current_field_name = if !self.editing_fields.is_empty()
+                && self.edit_field_index < self.editing_fields.len()
+            {
+                Some(self.editing_fields[self.edit_field_index].0.clone())
+            } else {
+                None
+            };
+
             // Only proceed if the host was serialized as an object
             if let serde_json::Value::Object(ref mut map) = host_value {
                 // Update each field based on the current input values
@@ -271,6 +280,16 @@ impl App {
                     Err(e) => {
                         // Log deserialization error
                         log_error(&format!("Failed to update host: {}", e));
+                    }
+                }
+
+                if let Some(field_name) = current_field_name {
+                    if let Some(index) = self
+                        .editing_fields
+                        .iter()
+                        .position(|(name, _)| *name == field_name)
+                    {
+                        self.edit_field_index = index;
                     }
                 }
             }
