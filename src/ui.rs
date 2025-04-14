@@ -77,6 +77,9 @@ pub struct App {
     /// Tracks whether the currently selected field is in active edit mode.
     in_field_edit: bool,
 
+    /// Stores the original name of the host being edited
+    original_host_name: Option<String>,
+
     new_fields: HashSet<String>,
 }
 
@@ -146,7 +149,7 @@ impl App {
             edit_field_index: 0,
             last_selected_index: None,
             in_field_edit: false,
-
+            original_host_name: None,
             new_fields: HashSet::new(),
         };
 
@@ -154,22 +157,6 @@ impl App {
         app.calculate_table_columns_constraints();
 
         Ok(app)
-    }
-
-    // Add this function to the App impl
-    fn has_changes(&self) -> bool {
-        if let Some(edited_host) = &self.edited_host {
-            if let Some(selected) = self.table_state.selected() {
-                if selected < self.hosts.len() {
-                    // Convert both to JSON to compare them more easily
-                    let original_json =
-                        serde_json::to_value(&self.hosts[selected]).unwrap_or_default();
-                    let edited_json = serde_json::to_value(edited_host).unwrap_or_default();
-                    return original_json != edited_json;
-                }
-            }
-        }
-        false
     }
 
     fn load_editing_fields(&mut self) {
@@ -185,6 +172,10 @@ impl App {
                 }
                 self.last_selected_index = Some(selected);
                 let host = &self.hosts[selected];
+
+                // Store the original host name
+                self.original_host_name = Some(host.name.clone());
+
                 self.edited_host = Some(host.clone());
                 // Reset editing state.
                 self.in_field_edit = false;
@@ -199,18 +190,15 @@ impl App {
     }
 
     fn commit_field(&mut self) {
-        // Only proceed if we have an edited host
-        if let Some(edited_host) = self.edited_host.as_mut() {
-            // Serialize the host to get its current state
-            let mut host_value = match serde_json::to_value(&mut *edited_host) {
-                Ok(value) => value,
-                Err(e) => {
-                    log_error(&format!("Failed to serialize host: {}", e));
-                    return;
-                }
+        // Step 1: Extract all the data we need before any modifications
+        let (edited_host_opt, current_field_name, original_name_opt, selected) = {
+            // Get the edited host and clone it to avoid borrow issues
+            let edited_host = match &self.edited_host {
+                Some(host) => host.clone(),
+                None => return,
             };
 
-            // Store the current field name being edited before we make changes
+            // Store the current field name
             let current_field_name = if !self.editing_fields.is_empty()
                 && self.edit_field_index < self.editing_fields.len()
             {
@@ -219,79 +207,159 @@ impl App {
                 None
             };
 
-            // Only proceed if the host was serialized as an object
-            if let serde_json::Value::Object(ref mut map) = host_value {
-                // Update each field based on the current input values
-                for (field_name, input) in &self.editing_fields {
-                    let snake_case_field = to_snake_case(field_name);
-                    let value = input.value().to_string();
+            // Get the original name
+            let original_name = self.original_host_name.clone();
 
-                    // Set the value in the JSON map
-                    if value.is_empty() {
-                        // For empty values, use null except for "aliases" which should remain as empty string
-                        if snake_case_field == "aliases" {
-                            map.insert(snake_case_field, serde_json::Value::String(String::new()));
-                        } else {
-                            map.insert(snake_case_field, serde_json::Value::Null);
-                        }
+            // Get the selected index
+            let selected = self.table_state.selected();
+
+            (
+                Some(edited_host),
+                current_field_name,
+                original_name,
+                selected,
+            )
+        };
+
+        // Get a mutable reference to our edited host
+        let edited_host = match edited_host_opt {
+            Some(host) => host,
+            None => return,
+        };
+
+        // Step 2: Update the host with values from the form
+        // We need to serialize and update the edited_host
+        let mut host_value = match serde_json::to_value(&edited_host) {
+            Ok(value) => value,
+            Err(e) => {
+                log_error(&format!("Failed to serialize host: {}", e));
+                return;
+            }
+        };
+
+        // Only proceed if the host was serialized as an object
+        if let serde_json::Value::Object(ref mut map) = host_value {
+            // Update each field based on the current input values
+            for (field_name, input) in &self.editing_fields {
+                let snake_case_field = to_snake_case(field_name);
+                let value = input.value().to_string();
+
+                // Set the value in the JSON map
+                if value.is_empty() {
+                    // For empty values, use null except for "aliases" which should remain as empty string
+                    if snake_case_field == "aliases" {
+                        map.insert(snake_case_field, serde_json::Value::String(String::new()));
                     } else {
-                        map.insert(snake_case_field, serde_json::Value::String(value));
+                        map.insert(snake_case_field, serde_json::Value::Null);
                     }
+                } else {
+                    map.insert(snake_case_field, serde_json::Value::String(value));
+                }
+            }
+        } else {
+            // Not an object, can't proceed
+            return;
+        }
+
+        // Deserialize back to a Host struct
+        let updated_host = match serde_json::from_value::<ssh::Host>(host_value) {
+            Ok(host) => host,
+            Err(e) => {
+                log_error(&format!("Failed to update host: {}", e));
+                return;
+            }
+        };
+
+        // Step 3: Check if name has changed
+        let name_changed = match &original_name_opt {
+            Some(original_name) => original_name != &updated_host.name,
+            None => false,
+        };
+
+        // Step 4: Check if there are any actual changes by comparing with the original
+        let has_changes = if let Some(idx) = selected {
+            if idx < self.hosts.len() {
+                let original_json = serde_json::to_value(&self.hosts[idx]).unwrap_or_default();
+                let updated_json = serde_json::to_value(&updated_host).unwrap_or_default();
+                original_json != updated_json
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Only continue if there are changes to save
+        if !has_changes && !name_changed {
+            // Still update our edited host copy
+            self.edited_host = Some(updated_host);
+
+            // Stay on same field line
+            if let Some(field_name) = current_field_name {
+                if let Some(index) = self
+                    .editing_fields
+                    .iter()
+                    .position(|(name, _)| *name == field_name)
+                {
+                    self.edit_field_index = index;
+                }
+            }
+            return;
+        }
+
+        // Step 5: Save the changes
+        let user_config = ensure_user_ssh_config();
+
+        // Handle name changes first
+        if name_changed {
+            if let Some(original_name) = original_name_opt {
+                // Remove the old host entry
+                if let Err(e) = ssh::remove_host(&original_name, &user_config) {
+                    log_error(&format!("Failed to remove old host entry: {}", e));
                 }
 
-                // Deserialize back to a Host struct
-                match serde_json::from_value::<ssh::Host>(host_value) {
-                    Ok(updated_host) => {
-                        // Update the edited host
-                        *edited_host = updated_host.clone();
+                // Update our tracking of the original name
+                self.original_host_name = Some(updated_host.name.clone());
+            }
+        }
 
-                        // Check if there are any actual changes
-                        if self.has_changes() {
-                            // If we're editing an existing host, update it in the hosts list
-                            if let Some(selected) = self.table_state.selected() {
-                                if selected < self.hosts.len() {
-                                    // Get a mutable reference to the original entry
-                                    if let Some(host_entry) = self.hosts.get_mut(selected) {
-                                        // Update the entry with our edited version
-                                        *host_entry = updated_host.clone();
+        // Save the config
+        if let Err(e) = ssh::save_config(&updated_host, &user_config) {
+            log_error(&format!("Failed to save config: {}", e));
+        }
 
-                                        // Always save to ~/.ssh/config
-                                        let user_config = ensure_user_ssh_config();
-
-                                        if let Err(e) = ssh::save_config(host_entry, &user_config) {
-                                            log_error(&format!("Failed to save config: {}", e));
-                                        }
-
-                                        // After saving, we need to reload the search to update both
-                                        // the filtered and unfiltered views in the Searchable container
-                                        self.hosts.search(self.search.value());
-
-                                        // Make sure our last_selected_index is reset so that the form
-                                        // will be reloaded from the hosts list the next time
-                                        self.last_selected_index = None;
-
-                                        // Reload all form fields to ensure we have the latest values
-                                        self.load_editing_fields();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Log deserialization error
-                        log_error(&format!("Failed to update host: {}", e));
-                    }
+        // Step 6: Update in-memory host list
+        if let Some(idx) = selected {
+            if idx < self.hosts.len() {
+                // Update the entry
+                if let Some(host_entry) = self.hosts.get_mut(idx) {
+                    *host_entry = updated_host.clone();
+                } else {
+                    log_error(&format!("Failed to update host at index {}", idx));
                 }
 
-                if let Some(field_name) = current_field_name {
-                    if let Some(index) = self
-                        .editing_fields
-                        .iter()
-                        .position(|(name, _)| *name == field_name)
-                    {
-                        self.edit_field_index = index;
-                    }
-                }
+                // Update our edited_host with the changes
+                self.edited_host = Some(updated_host);
+
+                // Reload the search to update filtered views
+                self.hosts.search(self.search.value());
+
+                // Reset last_selected_index to ensure form reloading
+                self.last_selected_index = None;
+
+                // Reload form fields
+                self.load_editing_fields();
+            }
+        }
+
+        // Step 7: Restore cursor position
+        if let Some(field_name) = current_field_name {
+            if let Some(index) = self
+                .editing_fields
+                .iter()
+                .position(|(name, _)| *name == field_name)
+            {
+                self.edit_field_index = index;
             }
         }
     }

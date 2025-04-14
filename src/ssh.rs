@@ -3,9 +3,14 @@ use anyhow::anyhow;
 use handlebars::Handlebars;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::{collections::VecDeque, fs::OpenOptions};
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
 #[derive(Debug, Default, Serialize, Clone, PartialEq, Deserialize)]
@@ -594,4 +599,99 @@ pub fn ensure_user_ssh_config() -> String {
     }
 
     config_path.to_string_lossy().to_string()
+}
+
+/// Remove a host entry from the SSH config file.
+///
+/// # Arguments
+///
+/// * `host_name` - The name of the host to remove.
+/// * `config_path` - The path to the SSH config file.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or written.
+pub fn remove_host(host_name: &str, config_path: &str) -> anyhow::Result<()> {
+    use std::path::Path;
+
+    let path = Path::new(config_path);
+    if !path.exists() {
+        return Ok(()); // Nothing to remove if file doesn't exist
+    }
+
+    let mut existing_blocks: Vec<Vec<String>> = Vec::new();
+    let mut current_block: Vec<String> = Vec::new();
+    let mut found_target = false;
+
+    // Read the file and accumulate blocks, excluding the target host
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+
+        // A new block starts when a line starts with "Host " (case-insensitive)
+        if line.trim_start().to_lowercase().starts_with("host ") {
+            if !current_block.is_empty() {
+                existing_blocks.push(current_block);
+                current_block = Vec::new();
+            }
+
+            // Check if this is the host we want to remove
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() > 1 && tokens[1] == host_name {
+                found_target = true;
+                continue; // Skip this line to start removing the block
+            } else {
+                found_target = false;
+            }
+        }
+
+        // Only add line if we're not in the target block
+        if !found_target && !line.trim().is_empty() {
+            current_block.push(line);
+        }
+    }
+
+    // Add the last block if not empty and not the target
+    if !current_block.is_empty() && !found_target {
+        existing_blocks.push(current_block);
+    }
+
+    // Write the blocks back to the file, excluding the removed host
+    let temp_path = format!("{}.tmp", config_path);
+    let temp_file_path = Path::new(&temp_path);
+
+    // Create temp file with same permissions
+    let mut file_options = OpenOptions::new();
+    file_options.create(true).write(true).truncate(true);
+
+    if path.exists() {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            file_options.mode(mode);
+        }
+    } else {
+        file_options.mode(0o600);
+    }
+
+    let mut temp_file = file_options.open(temp_file_path)?;
+
+    // Write all blocks to the temp file
+    for (i, block) in existing_blocks.iter().enumerate() {
+        for line in block {
+            writeln!(temp_file, "{}", line)?;
+        }
+        if i < existing_blocks.len() - 1 {
+            writeln!(temp_file)?;
+        }
+    }
+
+    temp_file.flush()?;
+    drop(temp_file);
+
+    // Rename temp file to the actual file
+    fs::rename(temp_file_path, path)?;
+
+    Ok(())
 }
