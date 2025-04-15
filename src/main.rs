@@ -1,3 +1,4 @@
+pub mod log;
 pub mod searchable;
 pub mod ssh;
 pub mod ssh_config;

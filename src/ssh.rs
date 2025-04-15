@@ -1,12 +1,19 @@
+use crate::log::log_error;
 use anyhow::anyhow;
 use handlebars::Handlebars;
 use itertools::Itertools;
-use serde::Serialize;
-use std::collections::VecDeque;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::{collections::VecDeque, fs::OpenOptions};
 
 use crate::ssh_config::{self, parser_error::ParseError, HostVecExt};
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Default, Serialize, Clone, PartialEq, Deserialize)]
 pub struct Host {
     pub add_keys_to_agent: Option<String>,
     pub address_family: Option<String>,
@@ -142,15 +149,15 @@ impl Host {
         Ok(())
     }
 
+    /// Return all fields as (key, value) pairs where the value is a nonblank string.
     pub fn iter_fields(&self) -> Vec<(String, String)> {
         let mut fields = Vec::new();
 
         // Convert the struct to a JSON value.
-        // Note: This assumes all fields serialize as strings or null.
+        // NOTE: This assumes all fields serialize as either strings or null.
         if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(self) {
             for (key, value) in map {
-                // Convert each value to a string if possible,
-                // and ignore empty strings or null values.
+                // Only add non-null, nonblank string values.
                 if let serde_json::Value::String(s) = value {
                     if !s.trim().is_empty() {
                         fields.push((key, s));
@@ -199,7 +206,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
                 .first()
                 .unwrap_or(&String::new())
                 .clone(),
-            aliases: host.get_patterns().iter().skip(1).join(", "),
+            aliases: host.get_patterns().iter().skip(1).join(" "),
             user: host.get(&ssh_config::EntryType::User),
             hostname: host
                 .get(&ssh_config::EntryType::Hostname)
@@ -309,7 +316,382 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             visual_host_key: host.get(&ssh_config::EntryType::VisualHostKey),
             x_auth_location: host.get(&ssh_config::EntryType::XAuthLocation),
         })
+        .filter(|h| h.name != ".host")
         .collect::<Vec<Host>>();
 
     Ok(hosts)
+}
+
+/// Save or update a Host config entry in the given SSH config file.
+///
+/// # Arguments
+///
+/// * `host` - The host entry to save.
+/// * `config_path` - The path to the SSH config file.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or written.
+pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    let path = Path::new(config_path);
+
+    // Check file and directory permissions before attempting to write
+    if path.exists() {
+        // Check if we can read the file
+        match File::open(path) {
+            Ok(_) => {} // We can read the file
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot read SSH config file: {} - {}",
+                    config_path,
+                    e
+                ))
+            }
+        }
+
+        // Check if the file is writable
+        match OpenOptions::new().write(true).open(path) {
+            Ok(_) => {} // We can write to the file
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot write to SSH config file: {} - {}",
+                    config_path,
+                    e
+                ))
+            }
+        }
+    } else {
+        // Check if the parent directory exists and is writable
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                return Err(anyhow::anyhow!(
+                    "Parent directory doesn't exist: {}",
+                    parent.display()
+                ));
+            }
+
+            match OpenOptions::new().write(true).open(parent) {
+                Ok(_) => {} // We can write to the directory
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot write to directory: {} - {}",
+                        parent.display(),
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    let mut existing_blocks: Vec<Vec<String>> = Vec::new();
+    let mut current_block: Vec<String> = Vec::new();
+
+    // Read the file and accumulate blocks.
+    if path.exists() {
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            // A new block starts when a line starts with "host " (case-insensitive).
+            if line.trim_start().to_lowercase().starts_with("host ") {
+                if !current_block.is_empty() {
+                    existing_blocks.push(current_block);
+                    current_block = Vec::new();
+                }
+            }
+            // Only include nonblank lines.
+            if !line.trim().is_empty() {
+                current_block.push(line);
+            }
+        }
+        if !current_block.is_empty() {
+            existing_blocks.push(current_block);
+        }
+    }
+
+    // Look for an existing block that matches the host name.
+    let mut target_index: Option<usize> = None;
+    for (i, block) in existing_blocks.iter().enumerate() {
+        if let Some(first_line) = block.get(0) {
+            if first_line.trim_start().to_lowercase().starts_with("host ") {
+                let tokens: Vec<&str> = first_line.split_whitespace().collect();
+                // Assume the first token is "Host" and the second is the primary name.
+                if tokens.len() > 1 && tokens[1] == host.name {
+                    target_index = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    let new_block = format_host_block(host);
+    if let Some(i) = target_index {
+        existing_blocks[i] = new_block;
+    } else {
+        existing_blocks.push(new_block);
+    }
+
+    // Try to use a safer approach: write to a temporary file first
+    let temp_path = format!("{}.tmp", config_path);
+    let temp_file_path = Path::new(&temp_path);
+
+    // Create the temp file with the same permissions as the original
+    let mut file_options = OpenOptions::new();
+    file_options.create(true).write(true).truncate(true);
+
+    // If the original file exists, copy its permissions
+    if path.exists() {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            file_options.mode(mode);
+        }
+    } else {
+        // Default permissions for new SSH config: 0600 (user read/write only)
+        file_options.mode(0o600);
+    }
+
+    let mut temp_file = file_options
+        .open(temp_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create temporary file: {} - {}", temp_path, e))?;
+
+    // Write all blocks to the temp file
+    for (i, block) in existing_blocks.iter().enumerate() {
+        for line in block {
+            writeln!(temp_file, "{}", line)?;
+        }
+        if i < existing_blocks.len() - 1 {
+            writeln!(temp_file)?;
+        }
+    }
+
+    // Ensure all data is written
+    temp_file.flush()?;
+    drop(temp_file);
+
+    // Now rename the temp file to the actual file (atomic operation)
+    fs::rename(temp_file_path, path)
+        .map_err(|e| anyhow::anyhow!("Failed to save config file: {} - {}", config_path, e))?;
+
+    Ok(())
+}
+
+/// Convert a Host into lines of SSH config (Vec<String>).
+fn format_host_block(host: &Host) -> Vec<String> {
+    // Process the aliases field: split by comma, trim any whitespace,
+    // and collect non-empty entries.
+    let aliases = if !host.aliases.trim().is_empty() {
+        host.aliases
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<&str>>()
+            .join(" ")
+    } else {
+        String::new()
+    };
+
+    // Construct the Host header line.
+    // If there are aliases, append them after the primary host name.
+    let host_line = if aliases.is_empty() {
+        format!("Host {}", host.name)
+    } else {
+        format!("Host {} {}", host.name, aliases)
+    };
+
+    let mut lines = vec![host_line];
+
+    // Now output the rest of the fields.
+    // Exclude "name" and "aliases" from individual entries.
+    for (key, value) in host.iter_fields() {
+        if key != "name" && key != "aliases" {
+            let ssh_key = format_ssh_key(&key);
+            // Use exactly four spaces for indentation.
+            lines.push(format!("    {} {}", ssh_key, value));
+        }
+    }
+    lines
+}
+
+/// Convert snake_case field names into SSH config-style names.
+fn format_ssh_key(field: &str) -> String {
+    field
+        .split('_')
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub fn get_all_host_fields() -> Vec<String> {
+    let dummy_host = Host::default();
+    let json_val = serde_json::to_value(dummy_host).unwrap();
+    if let serde_json::Value::Object(map) = json_val {
+        map.keys().cloned().collect()
+    } else {
+        vec![]
+    }
+}
+
+/// Ensures the user's SSH config file exists and returns its path
+pub fn ensure_user_ssh_config() -> String {
+    use std::fs::create_dir_all;
+
+    // Get user's home directory
+    let home_dir = dirs::home_dir().expect("Could not determine home directory");
+    let ssh_dir = home_dir.join(".ssh");
+    let config_path = ssh_dir.join("config");
+
+    // Ensure .ssh directory exists
+    if !ssh_dir.exists() {
+        if let Err(e) = create_dir_all(&ssh_dir) {
+            log_error(&format!("Failed to create .ssh directory: {}", e));
+            return config_path.to_string_lossy().to_string();
+        }
+
+        // Set proper permissions on .ssh directory (0700 - only user can read/write/execute)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+            {
+                log_error(&format!(
+                    "Failed to set permissions on .ssh directory: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    // Create config file if it doesn't exist
+    if !config_path.exists() {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&config_path)
+        {
+            log_error(&format!("Failed to create SSH config file: {}", e));
+        } else {
+            // Set proper permissions on config file (0600 - only user can read/write)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    log_error(&format!(
+                        "Failed to set permissions on SSH config file: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    config_path.to_string_lossy().to_string()
+}
+
+/// Remove a host entry from the SSH config file.
+///
+/// # Arguments
+///
+/// * `host_name` - The name of the host to remove.
+/// * `config_path` - The path to the SSH config file.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or written.
+pub fn remove_host(host_name: &str, config_path: &str) -> anyhow::Result<()> {
+    use std::path::Path;
+
+    let path = Path::new(config_path);
+    if !path.exists() {
+        return Ok(()); // Nothing to remove if file doesn't exist
+    }
+
+    let mut existing_blocks: Vec<Vec<String>> = Vec::new();
+    let mut current_block: Vec<String> = Vec::new();
+    let mut found_target = false;
+
+    // Read the file and accumulate blocks, excluding the target host
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+
+        // A new block starts when a line starts with "Host " (case-insensitive)
+        if line.trim_start().to_lowercase().starts_with("host ") {
+            if !current_block.is_empty() {
+                existing_blocks.push(current_block);
+                current_block = Vec::new();
+            }
+
+            // Check if this is the host we want to remove
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() > 1 && tokens[1] == host_name {
+                found_target = true;
+                continue; // Skip this line to start removing the block
+            } else {
+                found_target = false;
+            }
+        }
+
+        // Only add line if we're not in the target block
+        if !found_target && !line.trim().is_empty() {
+            current_block.push(line);
+        }
+    }
+
+    // Add the last block if not empty and not the target
+    if !current_block.is_empty() && !found_target {
+        existing_blocks.push(current_block);
+    }
+
+    // Write the blocks back to the file, excluding the removed host
+    let temp_path = format!("{}.tmp", config_path);
+    let temp_file_path = Path::new(&temp_path);
+
+    // Create temp file with same permissions
+    let mut file_options = OpenOptions::new();
+    file_options.create(true).write(true).truncate(true);
+
+    if path.exists() {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            file_options.mode(mode);
+        }
+    } else {
+        file_options.mode(0o600);
+    }
+
+    let mut temp_file = file_options.open(temp_file_path)?;
+
+    // Write all blocks to the temp file
+    for (i, block) in existing_blocks.iter().enumerate() {
+        for line in block {
+            writeln!(temp_file, "{}", line)?;
+        }
+        if i < existing_blocks.len() - 1 {
+            writeln!(temp_file)?;
+        }
+    }
+
+    temp_file.flush()?;
+    drop(temp_file);
+
+    // Rename temp file to the actual file
+    fs::rename(temp_file_path, path)?;
+
+    Ok(())
 }

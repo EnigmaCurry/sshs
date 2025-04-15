@@ -5,7 +5,6 @@ where
     T: Clone,
 {
     vec: Vec<T>,
-
     filter: Box<SearchableFn<T>>,
     filtered: Vec<T>,
 }
@@ -21,7 +20,6 @@ where
     {
         let mut searchable = Self {
             vec,
-
             filter: Box::new(predicate),
             filtered: Vec::new(),
         };
@@ -38,7 +36,7 @@ where
         self.filtered = self
             .vec
             .iter()
-            .filter(|host| (self.filter)(host, value))
+            .filter(|item| (self.filter)(item, value))
             .cloned()
             .collect();
     }
@@ -82,5 +80,22 @@ where
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.filtered[index]
+    }
+}
+
+/// The following implementation provides mutable access to an element within the underlying
+/// vector that corresponds to the given index in the filtered view.
+/// Note: This requires that `T` implements PartialEq so we can match the filtered element
+/// with its original in `vec`.
+impl<T> Searchable<T>
+where
+    T: Clone + PartialEq,
+{
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        // Get the item from the filtered view.
+        let item = self.filtered.get(index)?;
+        // Find its corresponding position in the underlying vector.
+        let pos = self.vec.iter().position(|x| x == item)?;
+        Some(&mut self.vec[pos])
     }
 }
