@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Clear;
 #[allow(clippy::wildcard_imports)]
 use ratatui::{prelude::*, widgets::*};
@@ -28,9 +29,9 @@ use unicode_width::UnicodeWidthStr;
 
 // Separate help messages for left and right sides.
 const LEFT_HELP_MSG: &str =
-    "(Esc) quit | (↑/↓) navigate table | (Enter) start SSH session | (Tab) switch to edit";
+    "(Esc) quit | (↑/↓) select host | (type) filter list of hosts | (Enter) start SSH session | (Tab) switch to configs";
 const RIGHT_HELP_MSG: &str =
-    "(Esc) quit | (↑/↓) move field | (Enter) toggle edit mode | (Tab) switch to table";
+    "(Esc) quit | (↑/↓) select field | (Enter) toggle field edit mode | (Tab) switch to hosts";
 
 // Define focus state for the app.
 #[derive(PartialEq)]
@@ -795,42 +796,69 @@ where
     Ok(())
 }
 
+// Helper function to style help messages.
+// It splits each section on " | " and applies bold to the key inside parentheses.
+fn styled_help(msg: &str) -> Vec<Span<'static>> {
+    // Split the message into parts
+    let parts: Vec<&str> = msg.split(" | ").collect();
+    let mut spans: Vec<Span> = Vec::new();
+
+    for (i, part) in parts.iter().enumerate() {
+        let part = part.trim();
+        if let Some(end) = part.find(")") {
+            // Split into key (inside parentheses) and description.
+            let (key_part, description_part) = part.split_at(end + 1);
+            spans.push(Span::styled(
+                key_part.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let desc = description_part.trim_start();
+            if !desc.is_empty() {
+                spans.push(Span::raw(format!(" {}", desc)));
+            }
+        } else {
+            spans.push(Span::raw(part.to_string()));
+        }
+        // Add a separator between parts except for the last one.
+        if i != parts.len() - 1 {
+            spans.push(Span::raw(" | "));
+        }
+    }
+    spans
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
-    // Split the screen horizontally into left and right halves.
+    // Split the screen vertically into main content and a full-width help footer.
+    let vertical_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)].as_ref())
+        .split(f.size());
+    let main_area = vertical_chunks[0];
+    let help_area = vertical_chunks[1];
+
+    // Split the main area horizontally into left and right halves.
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(f.size());
+        .split(main_area);
 
-    // Left side layout: searchbar, table and a left footer.
-    let left_rects = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(5),
-        Constraint::Length(3),
-    ])
-    .split(horizontal_chunks[0]);
-
+    // Left side: searchbar and table.
+    let left_rects =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).split(horizontal_chunks[0]);
     render_searchbar(f, app, left_rects[0]);
     render_table(f, app, left_rects[1]);
-    render_left_footer(f, app, left_rects[2]);
 
-    // Right side layout: form (edit fields) and a right footer.
-    let right_rects =
-        Layout::vertical([Constraint::Min(7), Constraint::Length(3)]).split(horizontal_chunks[1]);
-
-    // In table mode, refresh the editing form on every draw.
+    // Right side: form (edit fields).
+    let right_rects = Layout::vertical([Constraint::Min(7)]).split(horizontal_chunks[1]);
     if app.focus == Focus::Table {
         app.load_editing_fields();
     }
-
-    // Build list items from editable fields.
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let form_items: Vec<ListItem> = app
         .editing_fields
         .iter()
         .enumerate()
         .map(|(i, (field, input))| {
-            // When not in active edit mode, highlight the selected row.
             let style = if (app.focus == Focus::Form)
                 && (!app.in_field_edit)
                 && (i == app.edit_field_index)
@@ -843,32 +871,43 @@ fn ui(f: &mut Frame, app: &mut App) {
             ListItem::new(content).style(style)
         })
         .collect();
-
     let form_list = List::new(form_items).block(
         Block::default()
-            .title("Configuration (Edit)")
+            // .title("Configuration (Edit)")
             .borders(Borders::ALL)
+            .border_style(Style::new().fg(app.palette.c400))
             .border_type(BorderType::Rounded),
     );
-
     f.render_widget(form_list, right_rects[0]);
-    render_right_footer(f, app, right_rects[1]);
 
-    // Position the cursor when in form editing mode.
+    // Build and render the full-width help footer with styled keys.
+    let help_spans = if app.focus == Focus::Table {
+        styled_help(LEFT_HELP_MSG)
+    } else {
+        styled_help(RIGHT_HELP_MSG)
+    };
+    // Wrap the spans into a Line, then create a Text from a vector of Lines.
+    let help_text = Text::from(vec![Line::from(help_spans)]);
+    let help_paragraph = Paragraph::new(help_text).centered().block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(app.palette.c400))
+            .border_type(BorderType::Rounded),
+    );
+    f.render_widget(help_paragraph, help_area);
+
+    // Set the cursor for form editing.
     if app.focus == Focus::Form && app.in_field_edit {
-        // Use the inner area of the form block.
         let form_area = right_rects[0];
         let inner_x = form_area.x + 1;
         let inner_y = form_area.y + 1;
         let (label, input) = &app.editing_fields[app.edit_field_index];
         let label_text = format!("{}: ", label);
-        let cursor_offset = input.cursor();
-        let x = inner_x + label_text.len() as u16 + cursor_offset as u16;
+        let x = inner_x + label_text.len() as u16 + input.cursor() as u16;
         let y = inner_y + app.edit_field_index as u16;
         f.set_cursor(x, y);
     }
-
-    // Position the cursor for the searchbar when in table mode.
+    // Set the cursor for the searchbar.
     if app.focus == Focus::Table {
         f.set_cursor(
             left_rects[0].x + u16::try_from(app.search.cursor()).unwrap_or_default() + 4,
@@ -876,31 +915,20 @@ fn ui(f: &mut Frame, app: &mut App) {
         );
     }
 
-    // === Render the modal if it is active ===
+    // Render the modal if active.
     if let Some(modal) = &app.add_field_modal {
-        // Use the new helper to set the modal height to 15 lines and width to 60% of the screen.
         let modal_area = centered_rect(15, 60, f.size());
-
-        // Draw a clear widget to mask underlying content.
         f.render_widget(Clear, modal_area);
-
-        // Calculate the available height for items inside the modal.
         let available_height = modal_area.height.saturating_sub(2) as usize;
         let total_items = modal.filtered_fields.len();
-
-        // Determine the scroll offset so that the selected item is always visible.
         let scroll_offset =
             if total_items > available_height && modal.selected_index >= available_height {
                 modal.selected_index - available_height + 1
             } else {
                 0
             };
-
-        // Calculate the slice of items that should be visible in the modal.
         let end_index = (scroll_offset + available_height).min(total_items);
         let visible_fields = &modal.filtered_fields[scroll_offset..end_index];
-
-        // Build list items for the visible slice.
         let modal_items: Vec<ListItem> = visible_fields
             .iter()
             .enumerate()
@@ -914,7 +942,6 @@ fn ui(f: &mut Frame, app: &mut App) {
                 ListItem::new(field.clone()).style(style)
             })
             .collect();
-
         let modal_list = List::new(modal_items)
             .block(
                 Block::default()
@@ -923,7 +950,6 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .border_type(BorderType::Rounded),
             )
             .highlight_symbol(">> ");
-
         f.render_widget(modal_list, modal_area);
     }
 }
@@ -1006,26 +1032,6 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
     f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-fn render_left_footer(f: &mut Frame, app: &App, area: Rect) {
-    let left_help = Paragraph::new(LEFT_HELP_MSG).centered().block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(app.palette.c400))
-            .border_type(BorderType::Rounded),
-    );
-    f.render_widget(left_help, area);
-}
-
-fn render_right_footer(f: &mut Frame, app: &App, area: Rect) {
-    let right_help = Paragraph::new(RIGHT_HELP_MSG).centered().block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(app.palette.c400))
-            .border_type(BorderType::Rounded),
-    );
-    f.render_widget(right_help, area);
 }
 
 fn to_pascal_case(s: &str) -> String {
