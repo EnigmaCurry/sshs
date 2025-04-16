@@ -31,7 +31,7 @@ use unicode_width::UnicodeWidthStr;
 const LEFT_HELP_MSG: &str =
     "(Esc) quit | (↑/↓) select host | (type) filter list of hosts | (Enter) start SSH session | (Tab) switch to configs";
 const RIGHT_HELP_MSG: &str =
-    "(Esc) quit | (↑/↓) select field | (Enter) toggle field edit mode | (Tab) switch to hosts";
+    "(Esc) quit | (↑/↓) select field | (Enter) toggle field edit mode | (a) add new field | (Tab) switch to hosts";
 
 // Define focus state for the app.
 #[derive(PartialEq)]
@@ -375,10 +375,14 @@ impl App {
             fields.sort_by(|(a, _), (b, _)| a.cmp(b));
 
             // Convert each (field, value) pair into your editing field representation.
-            self.editing_fields = fields
+            let mut edits = fields
                 .into_iter()
                 .map(|(field, value)| (to_pascal_case(&field), Input::from(value)))
-                .collect();
+                .collect::<Vec<_>>();
+
+            edits.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
+
+            self.editing_fields = edits;
 
             if self.edit_field_index >= self.editing_fields.len() {
                 self.edit_field_index = 0;
