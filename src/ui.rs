@@ -163,28 +163,12 @@ impl App {
     fn load_editing_fields(&mut self) {
         if let Some(selected) = self.table_state.selected() {
             if selected < self.hosts.len() {
-                // Only reload if selection has changed.
-                if let Some(last) = self.last_selected_index {
-                    // Even if the selection has not changed, refresh the fields for consistency.
-                    if last == selected {
-                        self.refresh_editing_fields();
-                        return;
-                    }
-                }
                 self.last_selected_index = Some(selected);
-                let host = &self.hosts[selected];
-
-                // Store the original host name
+                let host = self.hosts[selected].clone();
                 self.original_host_name = Some(host.name.clone());
-
-                self.edited_host = Some(host.clone());
-                // Reset editing state.
+                self.edited_host = Some(host);
                 self.in_field_edit = false;
                 self.edit_field_index = 0;
-
-                // Instead of manually iterating and pushing the fields, simply call
-                // refresh_editing_fields(), which takes care of building the editing_fields
-                // with the PascalCase conversion.
                 self.refresh_editing_fields();
             }
         }
@@ -448,13 +432,17 @@ impl App {
                     self.search.handle_event(&Event::Key(key));
                     self.hosts.search(self.search.value());
 
-                    let selected = self.table_state.selected().unwrap_or(0);
-                    if selected >= self.hosts.len() {
-                        self.table_state.select(Some(match self.hosts.len() {
-                            0 => 0,
-                            _ => self.hosts.len() - 1,
-                        }));
-                    }
+                    // clamp selection into new bounds
+                    let old_sel = self.table_state.selected().unwrap_or(0);
+                    let new_sel = if self.hosts.is_empty() {
+                        0
+                    } else {
+                        old_sel.min(self.hosts.len() - 1)
+                    };
+                    self.table_state.select(Some(new_sel));
+
+                    // *always* reload the right‑pane for the newly‑selected host
+                    self.load_editing_fields();
                 }
             }
         }
