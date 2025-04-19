@@ -353,32 +353,27 @@ impl App {
     /// This automatically excludes any fields that are now blank or set to null.
     fn refresh_editing_fields(&mut self) {
         if let Some(ref host) = self.edited_host {
-            // Serialize the host to JSON.
-            let host_value = serde_json::to_value(host).expect("Failed to serialize host");
-            let mut fields: Vec<(String, String)> = vec![];
-
-            if let serde_json::Value::Object(map) = host_value {
-                for (k, v) in map.into_iter() {
-                    // Convert the field value into a String.
-                    let value_str = match v {
-                        serde_json::Value::String(s) => s,
-                        _ => String::new(),
-                    };
-                    // Only include the field if it has a non‑blank value or is in the new_fields set.
-                    if !value_str.is_empty() || self.new_fields.contains(&k) {
-                        fields.push((k, value_str));
-                    }
+            // new: grab every entry, including repeats
+            let mut fields: Vec<(String, String)> = host
+                .all_entries()
+                .into_iter()
+                .map(|(et, val)| (et.to_string(), val))
+                .collect();
+            // also keep any user‑added but still‑empty fields visible
+            for k in &self.new_fields {
+                if !fields.iter().any(|(f, _)| f == k) {
+                    fields.push((k.clone(), String::new()));
                 }
             }
 
             // Sort fields for consistent ordering.
             fields.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-            // Convert each (field, value) pair into your editing field representation.
-            let mut edits = fields
+            // Convert into editing_fields with explicit sizing.
+            let mut edits: Vec<(String, Input)> = fields
                 .into_iter()
                 .map(|(field, value)| (to_pascal_case(&field), Input::from(value)))
-                .collect::<Vec<_>>();
+                .collect();
 
             edits.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
 
@@ -617,9 +612,12 @@ impl App {
                     KeyCode::Char('a') if !self.in_field_edit => {
                         let existing_fields: Vec<String> = if let Some(ref host) = self.edited_host
                         {
-                            host.iter_fields().into_iter().map(|(k, _)| k).collect()
+                            host.all_entries()
+                                .into_iter()
+                                .map(|(et, _)| et.to_string())
+                                .collect()
                         } else {
-                            vec![]
+                            Vec::new()
                         };
                         self.add_field_modal = Some(AddFieldModal::new(&existing_fields));
                         return Ok(AppKeyAction::Ok);

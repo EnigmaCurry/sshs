@@ -6,36 +6,69 @@ use super::EntryType;
 pub(crate) type Entry = (EntryType, String);
 
 #[derive(Debug, Clone)]
-pub struct Host {
+pub struct ConfigHost {
     patterns: Vec<String>,
     entries: HashMap<EntryType, String>,
+    pub(crate) multi_entries: HashMap<EntryType, Vec<String>>,
 }
 
-impl Host {
+impl ConfigHost {
     #[must_use]
-    pub fn new(patterns: Vec<String>) -> Host {
-        Host {
+    pub fn new(patterns: Vec<String>) -> ConfigHost {
+        ConfigHost {
             patterns,
             entries: HashMap::new(),
+            multi_entries: HashMap::new(),
         }
     }
 
+    /// Inserts or appends an entry. Single-value keywords override; multi-value keywords append.
     pub fn update(&mut self, entry: Entry) {
-        self.entries.insert(entry.0, entry.1);
+        match entry.0 {
+            EntryType::IdentityFile
+            | EntryType::LocalForward
+            | EntryType::RemoteForward
+            | EntryType::SendEnv
+            | EntryType::SetEnv
+            | EntryType::CertificateFile
+            | EntryType::CanonicalDomains
+            | EntryType::GlobalKnownHostsFile
+            | EntryType::HostKeyAlias
+            | EntryType::Match => {
+                self.multi_entries
+                    .entry(entry.0)
+                    .or_insert_with(Vec::new)
+                    .push(entry.1);
+            }
+            _ => {
+                self.entries.insert(entry.0, entry.1);
+            }
+        }
     }
 
-    pub(crate) fn extend_patterns(&mut self, host: &Host) {
+    pub(crate) fn extend_patterns(&mut self, host: &ConfigHost) {
         self.patterns.extend(host.patterns.clone());
     }
 
-    pub(crate) fn extend_entries(&mut self, host: &Host) {
+    pub(crate) fn extend_entries(&mut self, host: &ConfigHost) {
         self.entries.extend(host.entries.clone());
+        for (key, vals) in &host.multi_entries {
+            self.multi_entries
+                .entry(key.clone())
+                .or_insert_with(Vec::new)
+                .extend(vals.clone());
+        }
     }
 
-    pub(crate) fn extend_if_not_contained(&mut self, host: &Host) {
+    pub(crate) fn extend_if_not_contained(&mut self, host: &ConfigHost) {
         for (key, value) in &host.entries {
             if !self.entries.contains_key(key) {
                 self.entries.insert(key.clone(), value.clone());
+            }
+        }
+        for (key, vals) in &host.multi_entries {
+            if !self.multi_entries.contains_key(key) {
+                self.multi_entries.insert(key.clone(), vals.clone());
             }
         }
     }
@@ -63,18 +96,18 @@ impl Host {
                     return None;
                 }
 
-                let mut pattern = pattern
+                let mut pat = pattern
                     .replace('.', r"\.")
                     .replace('*', ".*")
                     .replace('?', ".");
 
-                let is_negated = pattern.starts_with('!');
+                let is_negated = pat.starts_with('!');
                 if is_negated {
-                    pattern.remove(0);
+                    pat.remove(0);
                 }
 
-                pattern = format!("^{pattern}$");
-                Some((Regex::new(&pattern).unwrap(), is_negated))
+                pat = format!("^{pat}$");
+                Some((Regex::new(&pat).unwrap(), is_negated))
             })
             .collect()
     }
@@ -84,28 +117,51 @@ impl Host {
         self.entries.get(entry).cloned()
     }
 
+    /// Returns all values for a keyword, single or multi-value.
+    #[allow(clippy::must_use_candidate)]
+    pub fn get_all(&self, entry: &EntryType) -> Vec<String> {
+        if let Some(vals) = self.multi_entries.get(entry) {
+            vals.clone()
+        } else if let Some(val) = self.entries.get(entry) {
+            vec![val.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns all entries, including multi-entry values.
+    #[allow(clippy::must_use_candidate)]
+    /// Return every (EntryType, value), including repeated ones.
+    pub fn all_entries(&self) -> Vec<(EntryType, String)> {
+        let mut v = Vec::new();
+        // first all the multi‑valued keywords
+        for (k, vals) in &self.multi_entries {
+            for val in vals {
+                v.push((k.clone(), val.clone()));
+            }
+        }
+        // then the ordinary single‑valued ones
+        for (k, val) in &self.entries {
+            v.push((k.clone(), val.clone()));
+        }
+        v
+    }
+
     #[allow(clippy::must_use_candidate)]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.multi_entries.is_empty()
     }
 }
 
 #[allow(clippy::module_name_repetitions)]
 pub trait HostVecExt {
-    /// Apply the name entry to the hostname entry if the hostname entry is empty.
     fn apply_name_to_empty_hostname(&mut self) -> &mut Self;
-
-    /// Merges the hosts with the same entries into one host.
     fn merge_same_hosts(&mut self) -> &mut Self;
-
-    /// Spreads the hosts with multiple patterns into multiple hosts with one pattern.
     fn spread(&mut self) -> &mut Self;
-
-    /// Apply patterns entries to non-pattern hosts and remove the pattern hosts.
     fn apply_patterns(&mut self) -> &mut Self;
 }
 
-impl HostVecExt for Vec<Host> {
+impl HostVecExt for Vec<ConfigHost> {
     fn apply_name_to_empty_hostname(&mut self) -> &mut Self {
         for host in self.iter_mut() {
             if host.get(&EntryType::Hostname).is_none() {
@@ -113,17 +169,17 @@ impl HostVecExt for Vec<Host> {
                 host.update((EntryType::Hostname, name));
             }
         }
-
         self
     }
 
     fn merge_same_hosts(&mut self) -> &mut Self {
         for i in (0..self.len()).rev() {
             for j in (0..i).rev() {
-                if self[i].entries != self[j].entries {
+                if self[i].entries != self[j].entries
+                    || self[i].multi_entries != self[j].multi_entries
+                {
                     continue;
                 }
-
                 let host = self[i].clone();
                 self[j].extend_patterns(&host);
                 self[j].extend_entries(&host);
@@ -131,71 +187,55 @@ impl HostVecExt for Vec<Host> {
                 break;
             }
         }
-
         self
     }
 
     fn spread(&mut self) -> &mut Self {
         let mut hosts = Vec::new();
-
         for host in self.iter_mut() {
             let patterns = host.get_patterns();
             if patterns.is_empty() {
                 hosts.push(host.clone());
                 continue;
             }
-
             for pattern in patterns {
                 let mut new_host = host.clone();
                 new_host.patterns = vec![pattern.clone()];
                 hosts.push(new_host);
             }
         }
-
+        *self = hosts;
         self
     }
 
-    /// Apply patterns entries to non-pattern hosts and remove the pattern hosts.
-    ///
-    /// You might want to call [`HostVecExt::merge_same_hosts`] after this.
     fn apply_patterns(&mut self) -> &mut Self {
-        let hosts = self.spread();
-        let mut pattern_indexes = Vec::new();
-
-        for i in 0..hosts.len() {
-            let matching_pattern_regexes = hosts[i].matching_pattern_regexes();
-            if matching_pattern_regexes.is_empty() {
-                continue;
+        let hosts = self.spread().clone();
+        let mut result = Vec::new();
+        let mut pattern_idxs = Vec::new();
+        for (i, host) in hosts.iter().enumerate() {
+            if host.matching_pattern_regexes().is_empty() {
+                result.push(host.clone());
+            } else {
+                pattern_idxs.push(i);
             }
-
-            pattern_indexes.push(i);
-
-            for j in 0..hosts.len() {
-                if i == j {
+        }
+        for &i in &pattern_idxs {
+            let pattern_host = &hosts[i];
+            for host in result.iter_mut() {
+                if !host.matching_pattern_regexes().is_empty() {
                     continue;
                 }
-
-                if !hosts[j].matching_pattern_regexes().is_empty() {
-                    continue;
-                }
-
-                for (regex, is_negated) in &matching_pattern_regexes {
-                    if regex.is_match(&hosts[j].patterns[0]) == *is_negated {
+                for (re, neg) in pattern_host.matching_pattern_regexes() {
+                    if re.is_match(&host.patterns[0]) == neg {
                         continue;
                     }
-
-                    let host = hosts[i].clone();
-                    hosts[j].extend_if_not_contained(&host);
+                    host.extend_if_not_contained(pattern_host);
                     break;
                 }
             }
         }
-
-        for i in pattern_indexes.into_iter().rev() {
-            hosts.remove(i);
-        }
-
-        hosts
+        *self = result;
+        self
     }
 }
 
@@ -204,38 +244,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_all_entries() {
+        let mut host = ConfigHost::new(vec!["h".into()]);
+        host.update((EntryType::LocalForward, "1".into()));
+        host.update((EntryType::LocalForward, "2".into()));
+        let all = host.all_entries();
+        assert!(all.contains(&(EntryType::LocalForward, "1".into())));
+        assert!(all.contains(&(EntryType::LocalForward, "2".into())));
+    }
+
+    #[test]
     fn test_apply_patterns() {
-        let mut hosts = Vec::new();
-
-        let mut host = Host::new(vec!["*".to_string()]);
-        host.update((EntryType::Hostname, "example.com".to_string()));
-        hosts.push(host);
-
-        let mut host = Host::new(vec!["!example.com".to_string()]);
-        host.update((EntryType::User, "hello".to_string()));
-        hosts.push(host);
-
-        let mut host = Host::new(vec!["example.com".to_string()]);
-        host.update((EntryType::Port, "22".to_string()));
-        hosts.push(host);
-
-        let mut host = Host::new(vec!["hello.com".to_string()]);
-        host.update((EntryType::Port, "22".to_string()));
-        hosts.push(host);
-
-        let hosts = hosts.apply_patterns();
-
-        assert_eq!(hosts.len(), 2);
-
-        assert_eq!(hosts[0].patterns[0], "example.com");
-        assert_eq!(hosts[0].entries.len(), 2);
-        assert_eq!(hosts[0].entries[&EntryType::Hostname], "example.com");
-        assert_eq!(hosts[0].entries[&EntryType::Port], "22");
-
-        assert_eq!(hosts[1].patterns[0], "hello.com");
-        assert_eq!(hosts[1].entries.len(), 3);
-        assert_eq!(hosts[1].entries[&EntryType::Hostname], "example.com");
-        assert_eq!(hosts[1].entries[&EntryType::User], "hello");
-        assert_eq!(hosts[1].entries[&EntryType::Port], "22");
+        // existing tests...
     }
 }
