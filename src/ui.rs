@@ -222,31 +222,48 @@ impl App {
             }
         };
 
-        // Only proceed if the host was serialized as an object
         if let serde_json::Value::Object(ref mut map) = host_value {
-            // Update each field based on the current input values
+            // Temp map to collect Vec fields before inserting into the real map
+            let mut temp_vec_fields: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+
             for (field_name, input) in &self.editing_fields {
                 let snake_case_field = to_snake_case(field_name);
                 let value = input.value().to_string();
 
-                // Set the value in the JSON map
                 if value.is_empty() {
-                    // For empty values, use null except for "aliases" which should remain as empty string
                     if snake_case_field == "aliases" {
                         map.insert(snake_case_field, serde_json::Value::String(String::new()));
                     } else {
                         map.insert(snake_case_field, serde_json::Value::Null);
                     }
+                } else if ssh::Host::vec_fields().contains(&snake_case_field.as_str()) {
+                    // Collect into temp Vec
+                    let values = value
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>();
+                    temp_vec_fields
+                        .entry(snake_case_field)
+                        .or_default()
+                        .extend(values);
                 } else {
+                    // Normal string field: just set directly
                     map.insert(snake_case_field, serde_json::Value::String(value));
                 }
             }
+
+            // After processing all inputs, insert Vec fields into the map
+            for (field, values) in temp_vec_fields {
+                let array = values.into_iter().map(serde_json::Value::String).collect();
+                map.insert(field, serde_json::Value::Array(array));
+            }
         } else {
-            // Not an object, can't proceed
             return;
         }
 
         // Deserialize back to a Host struct
+        log_error(&host_value.to_string());
         let updated_host = match serde_json::from_value::<ssh::Host>(host_value) {
             Ok(host) => host,
             Err(e) => {

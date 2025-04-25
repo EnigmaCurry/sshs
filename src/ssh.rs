@@ -178,6 +178,23 @@ impl Host {
 
         fields
     }
+
+    // List all of the fields that are required to be Vecs
+    // TODO: update this manually anytime you change the struct elements.
+    pub fn vec_fields() -> &'static [&'static str] {
+        &[
+            "canonical_domains",
+            "certificate_file",
+            "global_known_hosts_file",
+            "host_key_alias",
+            "identity_file",
+            "local_forward",
+            "match_field",
+            "remote_forward",
+            "send_env",
+            "set_env",
+        ]
+    }
 }
 
 #[derive(Debug)]
@@ -350,7 +367,6 @@ pub fn save_config(host: &Host, config_path: &str) -> anyhow::Result<()> {
     use std::path::Path;
 
     let path = Path::new(config_path);
-
     // Check file and directory permissions before attempting to write
     if path.exists() {
         // Check if we can read the file
