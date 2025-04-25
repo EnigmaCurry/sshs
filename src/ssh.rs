@@ -22,12 +22,12 @@ pub struct Host {
     pub bind_address: Option<String>,
     pub bind_interface: Option<String>,
     pub ca_signature_algorithms: Option<String>,
-    pub canonical_domains: Option<String>,
+    pub canonical_domains: Vec<String>,
     pub canonicalize_fallback_local: Option<String>,
     pub canonicalize_hostname: Option<String>,
     pub canonicalize_max_dots: Option<String>,
     pub canonicalize_permitted_cnames: Option<String>,
-    pub certificate_file: Option<String>,
+    pub certificate_file: Vec<String>,
     pub channel_timeout: Option<String>,
     pub check_host_ip: Option<String>,
     pub ciphers: Option<String>,
@@ -50,18 +50,18 @@ pub struct Host {
     pub forward_x11_timeout: Option<String>,
     pub forward_x11_trusted: Option<String>,
     pub gateway_ports: Option<String>,
-    pub global_known_hosts_file: Option<String>,
+    pub global_known_hosts_file: Vec<String>,
     pub gssapi_authentication: Option<String>,
     pub gssapi_delegate_credentials: Option<String>,
     pub hash_known_hosts: Option<String>,
     pub host_key_algorithms: Option<String>,
-    pub host_key_alias: Option<String>,
+    pub host_key_alias: Vec<String>,
     pub hostbased_accepted_algorithms: Option<String>,
     pub hostbased_authentication: Option<String>,
     pub hostname: String,
     pub identities_only: Option<String>,
     pub identity_agent: Option<String>,
-    pub identity_file: Option<String>,
+    pub identity_file: Vec<String>,
     pub ignore_unknown: Option<String>,
     pub include: Option<String>,
     pub ipqos: Option<String>,
@@ -70,11 +70,11 @@ pub struct Host {
     pub kex_algorithms: Option<String>,
     pub known_hosts_command: Option<String>,
     pub local_command: Option<String>,
-    pub local_forward: Option<String>,
+    pub local_forward: Vec<String>,
     pub log_level: Option<String>,
     pub log_verbose: Option<String>,
     pub macs: Option<String>,
-    pub match_field: Option<String>,
+    pub match_field: Vec<String>,
     pub name: String,
     pub no_host_authentication_for_localhost: Option<String>,
     pub number_of_password_prompts: Option<String>,
@@ -92,16 +92,16 @@ pub struct Host {
     pub pubkey_authentication: Option<String>,
     pub rekey_limit: Option<String>,
     pub remote_command: Option<String>,
-    pub remote_forward: Option<String>,
+    pub remote_forward: Vec<String>,
     pub request_tty: Option<String>,
     pub required_rsa_size: Option<String>,
     pub revoked_host_keys: Option<String>,
     pub security_key_provider: Option<String>,
-    pub send_env: Option<String>,
+    pub send_env: Vec<String>,
     pub server_alive_count_max: Option<String>,
     pub server_alive_interval: Option<String>,
     pub session_type: Option<String>,
-    pub set_env: Option<String>,
+    pub set_env: Vec<String>,
     pub stdin_null: Option<String>,
     pub stream_local_bind_mask: Option<String>,
     pub stream_local_bind_unlink: Option<String>,
@@ -153,18 +153,29 @@ impl Host {
     pub fn iter_fields(&self) -> Vec<(String, String)> {
         let mut fields = Vec::new();
 
-        // Convert the struct to a JSON value.
-        // NOTE: This assumes all fields serialize as either strings or null.
+        // Convert the struct to a JSON value and iterate over its entries.
         if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(self) {
             for (key, value) in map {
-                // Only add non-null, nonblank string values.
-                if let serde_json::Value::String(s) = value {
-                    if !s.trim().is_empty() {
+                match value {
+                    // Single-valued fields
+                    serde_json::Value::String(s) if !s.trim().is_empty() => {
                         fields.push((key, s));
                     }
+                    // Multi-valued fields stored as arrays
+                    serde_json::Value::Array(arr) => {
+                        for elem in arr {
+                            if let serde_json::Value::String(s) = elem {
+                                if !s.trim().is_empty() {
+                                    fields.push((key.clone(), s));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
+
         fields
     }
 }
@@ -214,13 +225,13 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             port: host.get(&ssh_config::EntryType::Port),
             proxy_command: host.get(&ssh_config::EntryType::ProxyCommand),
             identities_only: host.get(&ssh_config::EntryType::IdentitiesOnly),
-            match_field: host.get(&ssh_config::EntryType::Match),
+            match_field: host.get_all(&ssh_config::EntryType::Match),
             add_keys_to_agent: host.get(&ssh_config::EntryType::AddKeysToAgent),
             address_family: host.get(&ssh_config::EntryType::AddressFamily),
             batch_mode: host.get(&ssh_config::EntryType::BatchMode),
             bind_address: host.get(&ssh_config::EntryType::BindAddress),
             bind_interface: host.get(&ssh_config::EntryType::BindInterface),
-            canonical_domains: host.get(&ssh_config::EntryType::CanonicalDomains),
+            canonical_domains: host.get_all(&ssh_config::EntryType::CanonicalDomains),
             canonicalize_fallback_local: host
                 .get(&ssh_config::EntryType::CanonicalizeFallbackLocal),
             canonicalize_hostname: host.get(&ssh_config::EntryType::CanonicalizeHostname),
@@ -228,7 +239,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             canonicalize_permitted_cnames: host
                 .get(&ssh_config::EntryType::CanonicalizePermittedCNAMEs),
             ca_signature_algorithms: host.get(&ssh_config::EntryType::CASignatureAlgorithms),
-            certificate_file: host.get(&ssh_config::EntryType::CertificateFile),
+            certificate_file: host.get_all(&ssh_config::EntryType::CertificateFile),
             channel_timeout: host.get(&ssh_config::EntryType::ChannelTimeout),
             check_host_ip: host.get(&ssh_config::EntryType::CheckHostIP),
             ciphers: host.get(&ssh_config::EntryType::Ciphers),
@@ -251,7 +262,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             forward_x11_timeout: host.get(&ssh_config::EntryType::ForwardX11Timeout),
             forward_x11_trusted: host.get(&ssh_config::EntryType::ForwardX11Trusted),
             gateway_ports: host.get(&ssh_config::EntryType::GatewayPorts),
-            global_known_hosts_file: host.get(&ssh_config::EntryType::GlobalKnownHostsFile),
+            global_known_hosts_file: host.get_all(&ssh_config::EntryType::GlobalKnownHostsFile),
             gssapi_authentication: host.get(&ssh_config::EntryType::GSSAPIAuthentication),
             gssapi_delegate_credentials: host
                 .get(&ssh_config::EntryType::GSSAPIDelegateCredentials),
@@ -260,9 +271,9 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
                 .get(&ssh_config::EntryType::HostbasedAcceptedAlgorithms),
             hostbased_authentication: host.get(&ssh_config::EntryType::HostbasedAuthentication),
             host_key_algorithms: host.get(&ssh_config::EntryType::HostKeyAlgorithms),
-            host_key_alias: host.get(&ssh_config::EntryType::HostKeyAlias),
+            host_key_alias: host.get_all(&ssh_config::EntryType::HostKeyAlias),
             identity_agent: host.get(&ssh_config::EntryType::IdentityAgent),
-            identity_file: host.get(&ssh_config::EntryType::IdentityFile),
+            identity_file: host.get_all(&ssh_config::EntryType::IdentityFile),
             ignore_unknown: host.get(&ssh_config::EntryType::IgnoreUnknown),
             include: host.get(&ssh_config::EntryType::Include),
             ipqos: host.get(&ssh_config::EntryType::IPQoS),
@@ -272,7 +283,7 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             kex_algorithms: host.get(&ssh_config::EntryType::KexAlgorithms),
             known_hosts_command: host.get(&ssh_config::EntryType::KnownHostsCommand),
             local_command: host.get(&ssh_config::EntryType::LocalCommand),
-            local_forward: host.get(&ssh_config::EntryType::LocalForward),
+            local_forward: host.get_all(&ssh_config::EntryType::LocalForward),
             log_level: host.get(&ssh_config::EntryType::LogLevel),
             log_verbose: host.get(&ssh_config::EntryType::LogVerbose),
             macs: host.get(&ssh_config::EntryType::MACs),
@@ -291,16 +302,16 @@ pub fn parse_config(raw_path: &String) -> Result<Vec<Host>, ParseConfigError> {
             pubkey_authentication: host.get(&ssh_config::EntryType::PubkeyAuthentication),
             rekey_limit: host.get(&ssh_config::EntryType::RekeyLimit),
             remote_command: host.get(&ssh_config::EntryType::RemoteCommand),
-            remote_forward: host.get(&ssh_config::EntryType::RemoteForward),
+            remote_forward: host.get_all(&ssh_config::EntryType::RemoteForward),
             request_tty: host.get(&ssh_config::EntryType::RequestTTY),
             required_rsa_size: host.get(&ssh_config::EntryType::RequiredRSASize),
             revoked_host_keys: host.get(&ssh_config::EntryType::RevokedHostKeys),
             security_key_provider: host.get(&ssh_config::EntryType::SecurityKeyProvider),
-            send_env: host.get(&ssh_config::EntryType::SendEnv),
+            send_env: host.get_all(&ssh_config::EntryType::SendEnv),
             server_alive_count_max: host.get(&ssh_config::EntryType::ServerAliveCountMax),
             server_alive_interval: host.get(&ssh_config::EntryType::ServerAliveInterval),
             session_type: host.get(&ssh_config::EntryType::SessionType),
-            set_env: host.get(&ssh_config::EntryType::SetEnv),
+            set_env: host.get_all(&ssh_config::EntryType::SetEnv),
             stdin_null: host.get(&ssh_config::EntryType::StdinNull),
             stream_local_bind_mask: host.get(&ssh_config::EntryType::StreamLocalBindMask),
             stream_local_bind_unlink: host.get(&ssh_config::EntryType::StreamLocalBindUnlink),

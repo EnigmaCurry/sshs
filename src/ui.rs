@@ -353,12 +353,8 @@ impl App {
     /// This automatically excludes any fields that are now blank or set to null.
     fn refresh_editing_fields(&mut self) {
         if let Some(ref host) = self.edited_host {
-            // new: grab every entry, including repeats
-            let mut fields: Vec<(String, String)> = host
-                .all_entries()
-                .into_iter()
-                .map(|(et, val)| (et.to_string(), val))
-                .collect();
+            // pull every (key, value) pair directly
+            let mut fields: Vec<(String, String)> = host.iter_fields();
             // also keep any user‑added but still‑empty fields visible
             for k in &self.new_fields {
                 if !fields.iter().any(|(f, _)| f == k) {
@@ -612,10 +608,7 @@ impl App {
                     KeyCode::Char('a') if !self.in_field_edit => {
                         let existing_fields: Vec<String> = if let Some(ref host) = self.edited_host
                         {
-                            host.all_entries()
-                                .into_iter()
-                                .map(|(et, _)| et.to_string())
-                                .collect()
+                            host.iter_fields().into_iter().map(|(et, _)| et).collect()
                         } else {
                             Vec::new()
                         };
