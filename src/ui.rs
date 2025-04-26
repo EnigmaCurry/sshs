@@ -81,7 +81,7 @@ pub struct App {
     /// Stores the original name of the host being edited
     original_host_name: Option<String>,
 
-    new_fields: HashSet<String>,
+    new_fields: Vec<String>,
 }
 
 #[derive(PartialEq)]
@@ -151,7 +151,7 @@ impl App {
             last_selected_index: None,
             in_field_edit: false,
             original_host_name: None,
-            new_fields: HashSet::new(),
+            new_fields: Vec::new(),
         };
 
         let mut app = app;
@@ -239,14 +239,10 @@ impl App {
                     }
                 } else if ssh::Host::vec_fields().contains(&snake_case_field.as_str()) {
                     // Collect into temp Vec
-                    let values = value
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>();
                     temp_vec_fields
                         .entry(snake_case_field)
                         .or_default()
-                        .extend(values);
+                        .push(value);
                 } else {
                     // Normal string field: just set directly
                     map.insert(snake_case_field, serde_json::Value::String(value));
@@ -328,6 +324,8 @@ impl App {
         // Save the config
         if let Err(e) = ssh::save_config(&updated_host, &user_config) {
             log_error(&format!("Failed to save config: {}", e));
+        } else {
+            self.new_fields.clear();
         }
 
         // Step 6: Update in-memory host list
@@ -374,9 +372,7 @@ impl App {
             let mut fields: Vec<(String, String)> = host.iter_fields();
             // also keep any user‑added but still‑empty fields visible
             for k in &self.new_fields {
-                if !fields.iter().any(|(f, _)| f == k) {
-                    fields.push((k.clone(), String::new()));
-                }
+                fields.push((k.clone(), String::new()));
             }
 
             // Sort fields for consistent ordering.
@@ -482,7 +478,7 @@ impl App {
                         let chosen_field = modal.filtered_fields[modal.selected_index].clone();
 
                         // Record that this field was explicitly added.
-                        self.new_fields.insert(chosen_field.clone());
+                        self.new_fields.push(chosen_field.clone());
 
                         // Update the host: insert the new field with an empty value.
                         if let Some(ref mut host) = self.edited_host {
@@ -490,8 +486,21 @@ impl App {
                                 serde_json::to_value(&mut *host).expect("Failed to serialize host");
                             if let serde_json::Value::Object(ref mut map) = host_value {
                                 // Only insert if not already present.
-                                map.entry(chosen_field.clone())
-                                    .or_insert(serde_json::Value::String(String::new()));
+                                // figure out which fields are your multi-valued ones
+                                let vec_fields = ssh::Host::vec_fields();
+                                if vec_fields.contains(&chosen_field.as_str()) {
+                                    // for a Vec<String> field, make sure it’s an Array and push one more empty string
+                                    let entry = map
+                                        .entry(chosen_field.clone())
+                                        .or_insert(serde_json::Value::Array(vec![]));
+                                    if let serde_json::Value::Array(ref mut arr) = entry {
+                                        arr.push(serde_json::Value::String(String::new()));
+                                    }
+                                } else {
+                                    // single-valued fields still get the old behavior
+                                    map.entry(chosen_field.clone())
+                                        .or_insert(serde_json::Value::String(String::new()));
+                                }
                             }
                             *host =
                                 serde_json::from_value(host_value).expect("Failed to update host");
@@ -503,7 +512,7 @@ impl App {
                         if let Some(idx) = self
                             .editing_fields
                             .iter()
-                            .position(|(f, _)| f == &to_pascal_case(&chosen_field))
+                            .rposition(|(f, _)| f == &to_pascal_case(&chosen_field))
                         {
                             self.edit_field_index = idx;
                         }
@@ -1078,12 +1087,21 @@ impl AddFieldModal {
     pub fn new(existing_fields: &[String]) -> Self {
         // Get all field names from the Host struct dynamically.
         let all_fields = ssh::get_all_host_fields();
+        // after
+        let vec_fields = ssh::Host::vec_fields();
         let available_fields: Vec<String> = all_fields
             .into_iter()
             .filter(|field| {
+                // we never want to add name or aliases
+                if field == "name" || field == "aliases" {
+                    return false;
+                }
+                // if it's a Vec<String> field, always keep it in the list
+                if vec_fields.contains(&field.as_str()) {
+                    return true;
+                }
+                // otherwise (String fields), only keep it if it's not already present
                 !existing_fields.contains(field)
-                    && field != "name"    // Exclude if always present.
-                    && field != "aliases" // Exclude if always shown.
             })
             .collect();
 
