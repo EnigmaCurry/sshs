@@ -932,9 +932,22 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Render the modal if active.
     if let Some(modal) = &app.add_field_modal {
+        // carve out a 2-line filter input above the list
         let modal_area = centered_rect(15, 60, f.size());
         f.render_widget(Clear, modal_area);
-        let available_height = modal_area.height.saturating_sub(2) as usize;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
+            .split(modal_area);
+
+        // 1) show what the user is typing
+        let filter_block = Paragraph::new(modal.filter.value())
+            .block(Block::default().title("Filter").borders(Borders::ALL));
+        f.render_widget(filter_block, chunks[0]);
+
+        // 2) then the list of completions
+        let list_area = chunks[1];
+        let available_height = list_area.height.saturating_sub(2) as usize;
         let total_items = modal.filtered_fields.len();
         let scroll_offset =
             if total_items > available_height && modal.selected_index >= available_height {
@@ -965,7 +978,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .border_type(BorderType::Rounded),
             )
             .highlight_symbol(">> ");
-        f.render_widget(modal_list, modal_area);
+        f.render_widget(modal_list, list_area);
     }
 }
 
