@@ -232,7 +232,13 @@ impl App {
                 let value = input.value().to_string();
 
                 if value.is_empty() {
-                    if snake_case_field == "aliases" {
+                    // if it's one of the Vec<String> fields, use an empty array
+                    if ssh::Host::vec_fields().contains(&snake_case_field.as_str()) {
+                        map.insert(
+                            snake_case_field.clone(),
+                            serde_json::Value::Array(Vec::new()),
+                        );
+                    } else if snake_case_field == "aliases" {
                         map.insert(snake_case_field, serde_json::Value::String(String::new()));
                     } else {
                         map.insert(snake_case_field, serde_json::Value::Null);
